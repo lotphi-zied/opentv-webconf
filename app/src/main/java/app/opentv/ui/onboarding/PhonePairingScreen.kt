@@ -36,10 +36,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import app.opentv.R
 import app.opentv.data.model.Source
 import app.opentv.pairing.PairingServer
@@ -52,17 +52,18 @@ import kotlinx.coroutines.cancel
 /**
  * "Set it up from your phone."
  *
- * Shows a QR code pointing at a web server running on this television, plus a six-digit code
- * the phone must echo back. See [PairingServer] for why it works this way rather than through
- * a website.
+ * Shows a QR code and a plain address (e.g. `192.168.0.14:9090`) pointing at a web server
+ * running on this television. No token and no code: any browser on the local network can open
+ * the page. See [PairingServer] for why it works this way rather than through a website.
  */
 @Composable
 fun PhonePairingScreen(
-    onReceived: (Source) -> Unit,
+    onReceived: (draft: Source?, confUrl: String?) -> Unit,
     onCancel: () -> Unit,
 ) {
+    val context = LocalContext.current
     val scope = remember { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) }
-    val server = remember { PairingServer(scope) }
+    val server = remember { PairingServer(context, scope) }
     val state by server.state.collectAsState()
 
     DisposableEffect(Unit) {
@@ -76,7 +77,7 @@ fun PhonePairingScreen(
     }
 
     LaunchedEffect(state) {
-        (state as? PairingServer.State.Received)?.let { onReceived(it.draft) }
+        (state as? PairingServer.State.Received)?.let { onReceived(it.draft, it.confUrl) }
     }
 
     Box(Modifier.fillMaxSize().padding(32.dp), contentAlignment = Alignment.Center) {
@@ -146,27 +147,12 @@ private fun Listening(session: PairingServer.Session, onCancel: () -> Unit) {
 
             Spacer(Modifier.height(28.dp))
             Text(
-                stringResource(R.string.pairing_enter_code),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.height(6.dp))
-            Text(
-                // Spaced out because it is being read across a room and typed into a phone.
-                text = session.confirmCode.toCharArray().joinToString("  "),
-                fontSize = 52.sp,
-                style = MaterialTheme.typography.displaySmall,
-                color = MaterialTheme.colorScheme.primary,
-            )
-
-            Spacer(Modifier.height(24.dp))
-            Text(
                 stringResource(R.string.pairing_camera_fail),
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Spacer(Modifier.height(4.dp))
-            Text(session.shortUrl, style = MaterialTheme.typography.titleLarge)
+            Text(session.shortUrl, style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary)
 
             Spacer(Modifier.height(32.dp))
             OutlinedButton(onClick = onCancel) { Text(stringResource(R.string.pairing_type_on_tv)) }
