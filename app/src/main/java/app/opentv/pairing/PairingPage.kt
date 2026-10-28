@@ -8,107 +8,110 @@ package app.opentv.pairing
 /**
  * The page the phone sees.
  *
- * Deliberately one self-contained document with no external requests of any kind — no fonts,
+ * Reachable without any token or code. Deliberately one self-contained document with no external requests of any kind — no fonts,
  * no frameworks, no analytics. The phone is talking to a television on the local network,
  * which may have no route to the internet at all, and a page that needs a CDN to render would
  * simply fail.
  */
 object PairingPage {
 
-    fun form(token: String, error: String?): String = page(
-        """
-        <h1>Set up OpenTV</h1>
-        <p class="sub">Filling this in here beats using the remote.</p>
+    fun form(error: String?, french: Boolean = false): String {
+        val t = if (french) FR else EN
+        return page(
+            french,
+            """
+        <h1>${t.title}</h1>
+        <p class="sub">${t.sub}</p>
 
         ${if (error != null) "<div class=\"error\">${escape(error)}</div>" else ""}
 
         <form method="post" action="/submit" autocomplete="off">
-          <input type="hidden" name="t" value="${escape(token)}">
-
           <div class="seg">
             <label class="segbtn">
-              <input type="radio" name="kind" value="xtream" checked onchange="toggle()">
-              <span>Xtream login</span>
+              <input type="radio" name="kind" value="xtream" checked onchange="refresh()">
+              <span>${t.xtream}</span>
             </label>
             <label class="segbtn">
-              <input type="radio" name="kind" value="m3u" onchange="toggle()">
-              <span>M3U playlist</span>
+              <input type="radio" name="kind" value="m3u" onchange="refresh()">
+              <span>${t.m3u}</span>
             </label>
           </div>
 
-          <label for="name">Name <span class="opt">optional</span></label>
-          <input id="name" name="name" type="text" placeholder="Living room provider">
+          <label for="name">${t.name} <span class="opt">${t.optional}</span></label>
+          <input id="name" name="name" type="text" placeholder="${t.namePlaceholder}">
 
-          <label for="url" id="url-label">Server address</label>
-          <input id="url" name="url" type="url" inputmode="url" required
+          <label for="url" id="url-label">${t.serverAddress}</label>
+          <input id="url" name="url" type="url" inputmode="url"
                  placeholder="http://example.com:8080"
-                 autocapitalize="off" autocorrect="off" spellcheck="false">
-          <p class="hint" id="url-hint">
-            Paste the whole line from your provider if that's easier — extra bits get trimmed.
-          </p>
+                 autocapitalize="off" autocorrect="off" spellcheck="false" oninput="refresh()">
+          <p class="hint" id="url-hint">${t.serverHint}</p>
 
           <div id="creds">
-            <label for="username">Username</label>
+            <label for="username">${t.username}</label>
             <input id="username" name="username" type="text"
                    autocapitalize="off" autocorrect="off" spellcheck="false">
 
-            <label for="password">Password</label>
+            <label for="password">${t.password}</label>
             <input id="password" name="password" type="password">
           </div>
 
-          <label for="epg">Guide (XMLTV) URL <span class="opt">optional</span></label>
+          <label for="epg">${t.guide} <span class="opt">${t.optional}</span></label>
           <input id="epg" name="epg" type="url" inputmode="url"
                  autocapitalize="off" autocorrect="off" spellcheck="false">
-          <p class="hint">Leave blank to use your provider's guide automatically.</p>
+          <p class="hint">${t.guideHint}</p>
 
           <hr>
 
-          <label for="code">Code shown on the TV</label>
-          <input id="code" name="code" type="text" inputmode="numeric" pattern="[0-9]*"
-                 maxlength="6" required class="code" placeholder="000000"
-                 autocomplete="one-time-code">
-          <p class="hint">This is what proves it's you standing in front of the telly.</p>
+          <label for="conf">${t.conf} <span class="opt">${t.optional}</span></label>
+          <input id="conf" name="conf" type="url" inputmode="url"
+                 placeholder="https://example.com/conf.json"
+                 autocapitalize="off" autocorrect="off" spellcheck="false" oninput="refresh()">
+          <p class="hint">${t.confHint}</p>
 
-          <button type="submit">Send to TV</button>
+          <button type="submit">${t.send}</button>
         </form>
 
-        <p class="privacy">
-          This page is served by your television, over your own network. What you type goes
-          straight to it and nowhere else — there is no OpenTV account and no OpenTV server.
-        </p>
+        <p class="privacy">${t.privacy}</p>
 
         <script>
-          function toggle() {
+          var MSG_SERVER = ${js(t.serverAddress)};
+          var MSG_PLAYLIST = ${js(t.playlistUrl)};
+          var HINT_SERVER = ${js(t.serverHint)};
+          var HINT_PLAYLIST = ${js(t.playlistHint)};
+          function refresh() {
             var isM3u = document.querySelector('input[name=kind]:checked').value === 'm3u';
+            var hasUrl = document.getElementById('url').value.trim() !== '';
+            var hasConf = document.getElementById('conf').value.trim() !== '';
             document.getElementById('creds').style.display = isM3u ? 'none' : 'block';
-            document.getElementById('url-label').textContent =
-              isM3u ? 'Playlist URL' : 'Server address';
-            document.getElementById('url-hint').textContent = isM3u
-              ? 'The full http link to your .m3u or .m3u8 file.'
-              : "Paste the whole line from your provider if that's easier.";
-            document.getElementById('username').required = !isM3u;
-            document.getElementById('password').required = !isM3u;
+            document.getElementById('url-label').textContent = isM3u ? MSG_PLAYLIST : MSG_SERVER;
+            document.getElementById('url-hint').textContent = isM3u ? HINT_PLAYLIST : HINT_SERVER;
+            // The provider fields are only mandatory when no conf.json is given.
+            document.getElementById('url').required = !hasConf;
+            document.getElementById('username').required = !isM3u && hasUrl;
+            document.getElementById('password').required = !isM3u && hasUrl;
           }
-          toggle();
+          refresh();
         </script>
         """.trimIndent(),
-    )
+        )
+    }
 
-    fun message(title: String, body: String): String = page(
+    fun message(title: String, body: String, french: Boolean = false): String = page(
+        french,
         """
         <h1>${escape(title)}</h1>
         <p class="sub">${escape(body)}</p>
         """.trimIndent(),
     )
 
-    private fun page(content: String): String = """
+    private fun page(french: Boolean, content: String): String = """
         <!DOCTYPE html>
-        <html lang="en">
+        <html lang="${if (french) "fr" else "en"}">
         <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
         <meta name="robots" content="noindex, nofollow">
-        <title>Set up OpenTV</title>
+        <title>OpenTV</title>
         <style>
           :root { --bg:#07080c; --surface:#12141d; --line:#2a2f3d; --text:#e8eaf0;
                   --muted:#a8aec0; --accent:#7c93ff; --err:#ff6b6b; }
@@ -148,6 +151,94 @@ object PairingPage {
         </div></body>
         </html>
     """.trimIndent()
+
+    private class Texts(
+        val title: String,
+        val sub: String,
+        val xtream: String,
+        val m3u: String,
+        val name: String,
+        val namePlaceholder: String,
+        val optional: String,
+        val serverAddress: String,
+        val playlistUrl: String,
+        val serverHint: String,
+        val playlistHint: String,
+        val username: String,
+        val password: String,
+        val guide: String,
+        val guideHint: String,
+        val conf: String,
+        val confHint: String,
+        val send: String,
+        val privacy: String,
+    )
+
+    private val EN = Texts(
+        title = "Set up OpenTV",
+        sub = "Filling this in here beats using the remote.",
+        xtream = "Xtream login",
+        m3u = "M3U playlist",
+        name = "Name",
+        namePlaceholder = "Living room provider",
+        optional = "optional",
+        serverAddress = "Server address",
+        playlistUrl = "Playlist URL",
+        serverHint = "Paste the whole line from your provider if that's easier — extra bits get trimmed.",
+        playlistHint = "The full http link to your .m3u or .m3u8 file.",
+        username = "Username",
+        password = "Password",
+        guide = "Guide (XMLTV) URL",
+        guideHint = "Leave blank to use your provider's guide automatically.",
+        conf = "conf.json file URL",
+        confHint = "Optional. If set, OpenTV checks this file at every launch and updates your " +
+            "providers when it changes. You can leave the fields above empty if the file " +
+            "describes your providers.",
+        send = "Send to TV",
+        privacy = "This page is served by your television, over your own network. What you type " +
+            "goes straight to it and nowhere else — there is no OpenTV account and no OpenTV server.",
+    )
+
+    private val FR = Texts(
+        title = "Configurer OpenTV",
+        sub = "C'est bien plus simple ici qu'avec la télécommande.",
+        xtream = "Identifiants Xtream",
+        m3u = "Playlist M3U",
+        name = "Nom",
+        namePlaceholder = "Fournisseur du salon",
+        optional = "facultatif",
+        serverAddress = "Adresse du serveur",
+        playlistUrl = "URL de la playlist",
+        serverHint = "Collez la ligne complète de votre fournisseur si c'est plus simple — le superflu est retiré.",
+        playlistHint = "Le lien http complet vers votre fichier .m3u ou .m3u8.",
+        username = "Nom d'utilisateur",
+        password = "Mot de passe",
+        guide = "URL du guide (XMLTV)",
+        guideHint = "Laissez vide pour utiliser automatiquement le guide de votre fournisseur.",
+        conf = "URL du fichier conf.json",
+        confHint = "Facultatif. Si renseigné, OpenTV vérifie ce fichier à chaque démarrage et met à " +
+            "jour vos fournisseurs lorsqu'il change. Vous pouvez laisser les champs ci-dessus vides " +
+            "si le fichier décrit vos fournisseurs.",
+        send = "Envoyer à la TV",
+        privacy = "Cette page est servie par votre télévision, sur votre propre réseau. Ce que vous " +
+            "saisissez va directement vers elle et nulle part ailleurs — il n'y a ni compte OpenTV " +
+            "ni serveur OpenTV.",
+    )
+
+    /** A string as a JavaScript literal, safe to place inside an inline script block. */
+    private fun js(value: String): String = buildString {
+        append('"')
+        for (c in value) {
+            when (c) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '<' -> append("\\u003c")
+                else -> append(c)
+            }
+        }
+        append('"')
+    }
 
     /** Minimal HTML escaping. Everything interpolated into the page goes through here. */
     private fun escape(value: String): String = value
