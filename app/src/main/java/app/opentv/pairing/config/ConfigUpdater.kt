@@ -40,6 +40,15 @@ import org.json.JSONObject
  * }
  * ```
  *
+ * A flat single-provider file is accepted too, and common key names are understood:
+ * `url` / `xtream_server` / `server` / `host` / `m3u_url`, `username` / `xtream_user` / `user`,
+ * `password` / `xtream_pass` / `pass`, `type` / `kind`, `mac`, `epg` / `epg_url`, `name`:
+ *
+ * ```json
+ * { "type": "xtream", "xtream_server": "http://host:8080",
+ *   "xtream_user": "user", "xtream_pass": "pass" }
+ * ```
+ *
  * `version` (or `last_updated`) is optional; without it the SHA-256 of the whole file is used
  * to detect a change. A single source may also be given directly at the top level.
  */
@@ -111,14 +120,14 @@ object ConfigUpdater {
             download(confUrl)
         } catch (e: Exception) {
             Log.w(TAG, "Could not download conf.json", e)
-            return Result.Failed(e.message ?: e.javaClass.simpleName)
+            return Result.Failed("download: ${e.message ?: e.javaClass.simpleName}")
         }
 
         val parsed = try {
             parse(body)
         } catch (e: Exception) {
             Log.w(TAG, "Could not parse conf.json", e)
-            return Result.Failed(e.message ?: e.javaClass.simpleName)
+            return Result.Failed("format: ${e.message ?: e.javaClass.simpleName}")
         }
 
         val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -165,7 +174,7 @@ object ConfigUpdater {
         if (failed == 0) prefs.edit().putString(KEY_FINGERPRINT, fingerprint).apply()
 
         return if (failed == 0) Result.Updated(saved)
-        else Result.Failed("$failed/${parsed.sources.size}")
+        else Result.Failed("$failed/${parsed.sources.size} sources")
     }
 
     // ---- Download & parsing ----------------------------------------------------------------
@@ -224,7 +233,7 @@ object ConfigUpdater {
             }
         val sources = when {
             root.optJSONArray("sources") != null -> readSources(root.getJSONArray("sources"))
-            root.has("url") -> listOfNotNull(readSource(root))
+            URL_KEYS.any { root.has(it) } -> listOfNotNull(readSource(root))
             else -> emptyList()
         }
         if (sources.isEmpty()) throw IllegalStateException("No valid source in conf.json")
@@ -236,16 +245,26 @@ object ConfigUpdater {
             array.optJSONObject(index)?.let(::readSource)
         }
 
+    /** First non-blank string value found under any of [keys]. */
+    private fun pick(json: JSONObject, vararg keys: String): String? =
+        keys.firstNotNullOfOrNull { key ->
+            if (json.has(key) && !json.isNull(key)) json.get(key).toString().trim().takeIf { it.isNotEmpty() }
+            else null
+        }
+
+    private val URL_KEYS = listOf("url", "xtream_server", "server", "host", "m3u_url", "playlist", "portal")
+
     private fun readSource(json: JSONObject): Incoming? {
-        val url = json.optString("url").trim()
-        if (url.isEmpty()) return null
+        val url = pick(json, *URL_KEYS.toTypedArray()) ?: return null
 
-        val username = json.optString("username").trim().takeIf { it.isNotEmpty() }
-        val password = json.optString("password").takeIf { it.isNotEmpty() }
-        val mac = (json.optString("mac").ifBlank { json.optString("mac_address") })
-            .trim().takeIf { it.isNotEmpty() }
+        val username = pick(json, "username", "xtream_user", "user")
+        val password = json.let { j ->
+            listOf("password", "xtream_pass", "pass")
+                .firstNotNullOfOrNull { k -> if (j.has(k) && !j.isNull(k)) j.get(k).toString().takeIf { it.isNotEmpty() } else null }
+        }
+        val mac = pick(json, "mac", "mac_address")
 
-        val typeText = json.optString("type").ifBlank { json.optString("kind") }.trim().lowercase()
+        val typeText = (pick(json, "type", "kind") ?: "").lowercase()
         val kind = when (typeText) {
             "xtream", "xtream_codes", "xc" -> SourceKind.XTREAM
             "m3u", "m3u8", "playlist" -> SourceKind.M3U
@@ -257,16 +276,12 @@ object ConfigUpdater {
             }
         }
 
-        val name = json.optString("name").trim().ifBlank {
-            when (kind) {
-                SourceKind.M3U -> "My playlist"
-                else -> "My provider"
-            }
+        val name = pick(json, "name", "title") ?: when (kind) {
+            SourceKind.M3U -> "My playlist"
+            else -> "My provider"
         }
-        val epg = (json.optString("epg").ifBlank { json.optString("epg_url") })
-            .trim().takeIf { it.isNotEmpty() }
-        val userAgent = (json.optString("user_agent").ifBlank { json.optString("userAgent") })
-            .trim().takeIf { it.isNotEmpty() }
+        val epg = pick(json, "epg", "epg_url", "xmltv")
+        val userAgent = pick(json, "user_agent", "userAgent")
 
         return Incoming(name, kind, url, username, password, mac, epg, userAgent)
     }
