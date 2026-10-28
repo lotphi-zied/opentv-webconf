@@ -5,16 +5,19 @@
  */
 package app.opentv.pairing
 
+import android.content.Context
 import android.util.Log
+import app.opentv.R
+import app.opentv.config.ConfigUpdater
 import app.opentv.data.model.Source
 import app.opentv.data.model.SourceKind
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
@@ -25,40 +28,37 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Lets someone fill in their provider details from a phone instead of a TV remote.
+ * Lets someone fill in their provider details from a phone or a computer instead of a TV remote.
  *
  * ## Why the TV is the server
  *
- * The obvious way to build "scan a code, type on your phone, it appears on the telly" is a
- * website: the TV registers a code with a server, the phone posts to the same server, the TV
- * polls for it. Every streaming app does it that way.
+ * There is no cloud service behind this. The TV runs a small web server on the local network
+ * for as long as the pairing screen is open. Details go browser → TV over the user's own wifi
+ * and never leave the building. It works with the internet unplugged.
  *
- * It is the wrong choice here. That server has to be paid for every month forever, and it
- * would hold IPTV credentials for every user of the app. It is precisely the dependency that
- * means an app dies when its maintainer loses interest — which is the failure this whole
- * project exists in response to.
+ * ## Access
  *
- * So there is no server. The TV runs one, on the local network, for the couple of minutes the
- * pairing screen is open. Credentials go phone → TV over the user's own wifi and never leave
- * the building. It works with the internet unplugged.
+ * The page is open to anyone on the local network, with no token and no confirmation code:
+ * the address is simply `http://<tv-ip>:<port>/`. The remaining protections are:
  *
- * ## What stops the neighbours using it
- *
- * - It binds to the LAN on a **random high port**, and only while the pairing screen is open.
- * - The URL carries a **192-bit random token**. Knowing the IP and port is not enough.
- * - The phone must also enter a **six-digit code shown on the TV**. That is the part the user
- *   sees, and it is what defends against someone who somehow obtained the link.
+ * - The server only runs while the pairing screen is open.
  * - Requests from non-private addresses are refused outright.
- * - After [SESSION_TIMEOUT_MINUTES], or on success, the socket closes and the token is void.
- * - Five wrong codes and the session is burned.
+ * - After [SESSION_TIMEOUT_MINUTES], or on success, the socket closes.
+ *
+ * ## Ports
+ *
+ * The first free port of [PORTS] is used: 9090, then 1234, 8080 and 8888.
  */
-class PairingServer(private val scope: CoroutineScope) {
+class PairingServer(
+    context: Context,
+    private val scope: CoroutineScope,
+) {
+
+    private val appContext: Context = context.applicationContext
 
     data class Session(
-        /** What the QR code encodes, e.g. `http://192.168.0.14:41234/?t=…` */
+        /** What the QR code encodes, e.g. `http://192.168.0.14:9090/` */
         val url: String,
-        /** Shown on the TV, typed on the phone. */
-        val confirmCode: String,
         val host: String,
         val port: Int,
     ) {
@@ -69,8 +69,13 @@ class PairingServer(private val scope: CoroutineScope) {
     sealed interface State {
         data object Idle : State
         data class Listening(val session: Session) : State
-        /** The phone submitted details. The UI takes it from here. */
-        data class Received(val draft: Source) : State
+
+        /**
+         * The browser submitted something. [draft] is a provider typed in the form (null when only
+         * a conf.json address was given) and [confUrl] is the conf.json address, already saved.
+         */
+        data class Received(val draft: Source?, val confUrl: String?) : State
+
         data class Failed(val reason: String) : State
     }
 
@@ -78,33 +83,19 @@ class PairingServer(private val scope: CoroutineScope) {
     val state: StateFlow<State> = _state.asStateFlow()
 
     private var serverSocket: ServerSocket? = null
-    private var token: String = ""
-    private var confirmCode: String = ""
-    private var wrongCodeAttempts = 0
     @Volatile private var running = false
 
     fun start() {
         if (running) return
         val host = lanAddress()
         if (host == null) {
-            _state.value = State.Failed(
-                "This device doesn't appear to be on a network, so it can't talk to your phone.",
-            )
+            _state.value = State.Failed(appContext.getString(R.string.pairing_err_no_network))
             return
         }
 
-        val random = SecureRandom()
-        token = ByteArray(24).also(random::nextBytes).joinToString("") { "%02x".format(it) }
-        confirmCode = "%06d".format(random.nextInt(1_000_000))
-        wrongCodeAttempts = 0
-
-        val socket = try {
-            // Port 0 asks the OS for a free one. A fixed port would be predictable and would
-            // clash with whatever else the user runs at home.
-            ServerSocket(0)
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not open a socket", e)
-            _state.value = State.Failed("Could not start the pairing server on this device.")
+        val socket = openFirstFreePort()
+        if (socket == null) {
+            _state.value = State.Failed(appContext.getString(R.string.pairing_err_no_port))
             return
         }
 
@@ -112,8 +103,7 @@ class PairingServer(private val scope: CoroutineScope) {
         running = true
 
         val session = Session(
-            url = "http://$host:${socket.localPort}/?t=$token",
-            confirmCode = confirmCode,
+            url = "http://$host:${socket.localPort}/",
             host = host,
             port = socket.localPort,
         )
@@ -138,7 +128,7 @@ class PairingServer(private val scope: CoroutineScope) {
             kotlinx.coroutines.delay(TimeUnit.MINUTES.toMillis(SESSION_TIMEOUT_MINUTES))
             if (running && _state.value is State.Listening) {
                 stop()
-                _state.value = State.Failed("Pairing timed out. Start again when you're ready.")
+                _state.value = State.Failed(appContext.getString(R.string.pairing_err_timeout))
             }
         }
     }
@@ -147,9 +137,23 @@ class PairingServer(private val scope: CoroutineScope) {
         running = false
         runCatching { serverSocket?.close() }
         serverSocket = null
-        token = ""
-        confirmCode = ""
         if (_state.value is State.Listening) _state.value = State.Idle
+    }
+
+    private fun openFirstFreePort(): ServerSocket? {
+        for (port in PORTS) {
+            val candidate = try {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(port))
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Port $port unavailable", e)
+                null
+            }
+            if (candidate != null) return candidate
+        }
+        return null
     }
 
     // ---- Request handling ------------------------------------------------------------------
@@ -166,7 +170,7 @@ class PairingServer(private val scope: CoroutineScope) {
 
         val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.UTF_8))
         val requestLine = reader.readLine() ?: return
-        val (method, path, query) = PairingHttp.parseRequestLine(requestLine) ?: return
+        val (method, path, _) = PairingHttp.parseRequestLine(requestLine) ?: return
 
         val headers = HashMap<String, String>()
         while (true) {
@@ -176,30 +180,33 @@ class PairingServer(private val scope: CoroutineScope) {
         }
 
         val contentLength = (headers["content-length"]?.toIntOrNull() ?: 0)
-            .coerceAtMost(MAX_BODY_BYTES)
+            .coerceIn(0, MAX_BODY_BYTES)
         val body = if (contentLength > 0) {
             val buffer = CharArray(contentLength)
-            val read = reader.read(buffer, 0, contentLength)
-            if (read > 0) String(buffer, 0, read) else ""
+            var total = 0
+            while (total < contentLength) {
+                val read = reader.read(buffer, total, contentLength - total)
+                if (read < 0) break
+                total += read
+            }
+            String(buffer, 0, total)
         } else {
             ""
         }
 
+        val french = PairingHttp.prefersFrench(headers["accept-language"])
         val output = client.getOutputStream()
 
-        // Every route checks the token. Without it the page does not exist.
-        val supplied = query["t"] ?: PairingHttp.parseFormEncoded(body)["t"] ?: ""
-        if (token.isEmpty() || !PairingHttp.secretsMatch(supplied, token)) {
-            output.write(PairingHttp.httpResponse("404 Not Found", "text/plain", "Not found."))
-            return
-        }
-
         when {
-            method == "GET" -> output.write(
-                PairingHttp.httpResponse("200 OK", "text/html", PairingPage.form(token, null)),
+            method == "GET" && (path == "/" || path.isEmpty()) -> output.write(
+                PairingHttp.httpResponse("200 OK", "text/html", PairingPage.form(null, french)),
             )
 
-            method == "POST" && path.startsWith("/submit") -> handleSubmit(output, body)
+            method == "POST" && path.startsWith("/submit") -> handleSubmit(output, body, french)
+
+            method == "GET" -> output.write(
+                PairingHttp.httpResponse("404 Not Found", "text/plain", "Not found."),
+            )
 
             else -> output.write(
                 PairingHttp.httpResponse("405 Method Not Allowed", "text/plain", "No."),
@@ -207,84 +214,78 @@ class PairingServer(private val scope: CoroutineScope) {
         }
     }
 
-    private fun handleSubmit(output: java.io.OutputStream, body: String) {
+    private fun handleSubmit(output: java.io.OutputStream, body: String, french: Boolean) {
         val form = PairingHttp.parseFormEncoded(body)
 
-        val code = form["code"].orEmpty().filter { it.isDigit() }
-        if (!PairingHttp.secretsMatch(code, confirmCode)) {
-            wrongCodeAttempts++
-            if (wrongCodeAttempts >= MAX_CODE_ATTEMPTS) {
-                output.write(
-                    PairingHttp.httpResponse(
-                        "403 Forbidden",
-                        "text/html",
-                        PairingPage.message(
-                            "Too many attempts",
-                            "Start pairing again on the TV to get a new code.",
-                        ),
-                    ),
-                )
-                stop()
-                _state.value = State.Failed("Too many incorrect codes. Pairing cancelled.")
-                return
-            }
+        fun showError(message: String) {
             output.write(
                 PairingHttp.httpResponse(
                     "200 OK",
                     "text/html",
-                    PairingPage.form(
-                        token,
-                        "That code doesn't match the one on the TV. " +
-                            "${MAX_CODE_ATTEMPTS - wrongCodeAttempts} attempts left.",
-                    ),
+                    PairingPage.form(message, french),
                 ),
+            )
+        }
+
+        val rawConf = form["conf"].orEmpty().trim()
+        val confUrl = PairingHttp.cleanHttpUrl(rawConf)
+        if (rawConf.isNotEmpty() && confUrl == null) {
+            showError(
+                if (french) "L'adresse du fichier conf.json doit commencer par http:// ou https://."
+                else "The conf.json address must start with http:// or https://.",
             )
             return
         }
 
         val kind = if (form["kind"] == "m3u") SourceKind.M3U else SourceKind.XTREAM
         val url = form["url"].orEmpty().trim()
-        if (url.isEmpty()) {
-            output.write(
-                PairingHttp.httpResponse(
-                    "200 OK",
-                    "text/html",
-                    PairingPage.form(token, "Please fill in the server address."),
-                ),
+        if (url.isEmpty() && confUrl == null) {
+            showError(
+                if (french) "Renseignez l'adresse du serveur ou l'URL d'un fichier conf.json."
+                else "Please fill in the server address or a conf.json URL.",
             )
             return
         }
 
-        val draft = Source(
-            name = form["name"].orEmpty().trim().ifBlank {
-                if (kind == SourceKind.XTREAM) "My provider" else "My playlist"
-            },
-            kind = kind,
-            url = url,
-            username = form["username"]?.trim()?.takeIf { it.isNotEmpty() },
-            password = form["password"]?.takeIf { it.isNotEmpty() },
-            epgUrl = form["epg"]?.trim()?.takeIf { it.isNotEmpty() },
-        )
+        val draft = if (url.isEmpty()) {
+            null
+        } else {
+            Source(
+                name = form["name"].orEmpty().trim().ifBlank {
+                    if (kind == SourceKind.XTREAM) "My provider" else "My playlist"
+                },
+                kind = kind,
+                url = url,
+                username = form["username"]?.trim()?.takeIf { it.isNotEmpty() },
+                password = form["password"]?.takeIf { it.isNotEmpty() },
+                epgUrl = form["epg"]?.trim()?.takeIf { it.isNotEmpty() },
+            )
+        }
+
+        // Saved here, before the UI takes over, so the address survives even if the app is
+        // closed before the provider has finished loading.
+        if (confUrl != null) ConfigUpdater.saveConfUrl(appContext, confUrl)
 
         output.write(
             PairingHttp.httpResponse(
                 "200 OK",
                 "text/html",
                 PairingPage.message(
-                    "Sent to your TV",
-                    "You can put your phone down — the rest happens on the telly.",
+                    if (french) "Envoyé à votre TV" else "Sent to your TV",
+                    if (french) "Vous pouvez poser votre téléphone — la suite se passe sur la télé."
+                    else "You can put your phone down — the rest happens on the telly.",
+                    french,
                 ),
             ),
         )
         output.flush()
 
-        _state.value = State.Received(draft)
+        _state.value = State.Received(draft, confUrl)
         // Nothing more to receive. Shut the door immediately rather than leaving a socket
         // open on the user's network for the rest of the timeout.
         running = false
         runCatching { serverSocket?.close() }
         serverSocket = null
-        token = ""
     }
 
     // ---- Finding our own address -----------------------------------------------------------
@@ -322,6 +323,8 @@ class PairingServer(private val scope: CoroutineScope) {
         const val SESSION_TIMEOUT_MINUTES = 5L
         const val SOCKET_TIMEOUT_MILLIS = 15_000
         const val MAX_BODY_BYTES = 16 * 1024
-        const val MAX_CODE_ATTEMPTS = 5
+
+        /** Tried in this order; the first one that is free wins. */
+        val PORTS = intArrayOf(9090, 1234, 8080, 8888)
     }
 }
