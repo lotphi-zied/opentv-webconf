@@ -68,6 +68,21 @@ object PairingHttp {
     }
 
     /**
+     * Constant-time-ish comparison for secrets.
+     *
+     * Not used by the phone-pairing page any more (it has no token or code), but the web
+     * manager and the device-sync server still authenticate with a token and rely on it.
+     */
+    fun secretsMatch(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var difference = 0
+        for (i in a.indices) {
+            difference = difference or (a[i].code xor b[i].code)
+        }
+        return difference == 0
+    }
+
+    /**
      * Returns [raw] trimmed if it is a plausible absolute http(s) URL, otherwise null.
      * Used for the optional `conf.json` address coming from the web form.
      */
