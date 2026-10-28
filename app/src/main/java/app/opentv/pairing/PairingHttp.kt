@@ -68,26 +68,29 @@ object PairingHttp {
     }
 
     /**
-     * Constant-time-ish comparison for the pairing token.
-     *
-     * The token is only valid for a few minutes on a local network, so this is not load
-     * bearing — but comparing secrets with `==` is a habit worth not forming.
+     * Returns [raw] trimmed if it is a plausible absolute http(s) URL, otherwise null.
+     * Used for the optional `conf.json` address coming from the web form.
      */
-    fun secretsMatch(a: String, b: String): Boolean {
-        if (a.length != b.length) return false
-        var difference = 0
-        for (i in a.indices) {
-            difference = difference or (a[i].code xor b[i].code)
-        }
-        return difference == 0
+    fun cleanHttpUrl(raw: String?): String? {
+        val value = raw?.trim().orEmpty()
+        if (value.isEmpty()) return null
+        val lower = value.lowercase()
+        if (!lower.startsWith("http://") && !lower.startsWith("https://")) return null
+        if (value.length < 10 || value.any { it.isWhitespace() }) return null
+        return value
     }
+
+    /** True when the browser prefers French (first language tag of `Accept-Language`). */
+    fun prefersFrench(acceptLanguage: String?): Boolean =
+        acceptLanguage?.trim()?.lowercase()?.startsWith("fr") == true
 
     /**
      * True for addresses on a private network.
      *
      * The server binds to the LAN, so a request from a public address should be impossible.
      * Checking anyway costs nothing and means a misconfigured router cannot turn this into
-     * an internet-facing form that accepts IPTV credentials.
+     * an internet-facing form that accepts IPTV credentials. This is the only access check
+     * left now that the page is reachable without a token or a code.
      */
     fun isPrivateAddress(host: String?): Boolean {
         if (host.isNullOrBlank()) return false
