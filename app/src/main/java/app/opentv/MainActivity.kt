@@ -82,6 +82,10 @@ import app.opentv.ui.vod.PersonScreen
 import app.opentv.ui.vod.SeriesDetailScreen
 import app.opentv.ui.vod.VodPlayerScreen
 import app.opentv.update.UpdateGate
+import app.opentv.config.ConfigUpdater
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
+
 
 class MainActivity : ComponentActivity() {
 
@@ -251,6 +255,23 @@ private fun OpenTvApp(isTelevision: Boolean) {
     // Boot to last channel: if enabled and we have one, jump straight into the player on launch.
     // Runs once; backing out returns to the guide and doesn't re-trigger.
     val bootContext = androidx.compose.ui.platform.LocalContext.current
+	// Mise à jour en arrière-plan depuis conf.json : une seule fois par lancement. Si le
+    // téléchargement échoue, ConfigUpdater ne touche à rien et les sources existantes restent.
+    LaunchedEffect(Unit) {
+        if (ConfigUpdater.getConfUrl(bootContext) == null) return@LaunchedEffect
+        ConfigUpdater.refresh(
+            context = bootContext,
+            existing = sourcesUi.sources,
+            saveSource = { source ->
+                suspendCancellableCoroutine<Boolean> { cont ->
+                    sourcesViewModel.saveAndSync(source) { ok ->
+                        if (cont.isActive) cont.resume(ok)
+                    }
+                }
+            },
+        )
+    }
+
     val bootSettings = remember { ServiceLocator.get(bootContext).settings }
     LaunchedEffect(start) {
         if (start == Routes.HOME && bootSettings.resumeLastChannel.value && bootSettings.lastChannelId != 0L) {
