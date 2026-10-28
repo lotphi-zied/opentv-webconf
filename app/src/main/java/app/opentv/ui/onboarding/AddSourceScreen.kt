@@ -34,8 +34,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import kotlin.coroutines.resume
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -44,6 +48,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import app.opentv.R
+import app.opentv.config.ConfigUpdater
 import app.opentv.data.model.Source
 import app.opentv.data.model.SourceKind
 import app.opentv.isRunningOnTelevision
@@ -68,24 +73,79 @@ fun AddSourceScreen(
     editingSourceId: Long? = null,
 ) {
     val context = LocalContext.current
-    // The QR "set it up from your phone" flow only makes sense on a TV — it serves a setup page
-    // FROM this device for a phone to fill in. On a phone that same screen shows a QR meant to be
-    // scanned BY a phone, which is nonsensical and traps the user — so a non-TV device defaults
-    // straight to the direct entry form. On a TV the QR is still offered first, because typing a
-    // server address and password with a d-pad is the worst moment in every app of this kind.
+    // The web setup flow only makes sense on a TV: it serves a setup page FROM this device for a
+    // browser on the same network to fill in. On a phone, the direct form is shown straight away.
+    // On a TV, a fresh add first offers a choice: type with the remote, or configure from the web.
     val isTelevision = remember(context) { isRunningOnTelevision(context) }
-    // Editing an existing provider always uses the direct form (the fields are pre-filled, and there
-    // is nothing to pair); only a fresh add on a TV offers the phone-pairing QR first.
-    var usePhone by remember { mutableStateOf(isTelevision && editingSourceId == null) }
+    val canChoose = isTelevision && editingSourceId == null
+    var showChoice by remember { mutableStateOf(canChoose) }
+    var usePhone by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     if (usePhone) {
         PhonePairingScreen(
             // Even on a failed sync, leave the pairing screen: the source is already saved, so the
             // home screen shows either the guide (success) or a recoverable error (failure) rather
             // than stranding the user on an endless "Got it — connecting…" spinner.
-            onReceived = { draft -> viewModel.saveAndSync(draft) { onFinished() } },
-            onCancel = { usePhone = false },
+            onReceived = { draft, confUrl ->
+                when {
+                    draft != null -> viewModel.saveAndSync(draft) { onFinished() }
+                    confUrl != null -> scope.launch {
+                        // Only a conf.json address was given: load the providers it describes.
+                        ConfigUpdater.refresh(
+                            context = context,
+                            existing = viewModel.ui.value.sources,
+                            force = true,
+                            saveSource = { source ->
+                                suspendCancellableCoroutine<Boolean> { cont ->
+                                    viewModel.saveAndSync(source) { ok ->
+                                        if (cont.isActive) cont.resume(ok)
+                                    }
+                                }
+                            },
+                        )
+                        onFinished()
+                    }
+                    else -> onFinished()
+                }
+            },
+            onCancel = {
+                usePhone = false
+                showChoice = false
+            },
         )
+        return
+    }
+
+    if (showChoice) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            Column(Modifier.widthIn(max = 640.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    stringResource(R.string.onboarding_choice_title),
+                    style = MaterialTheme.typography.displaySmall,
+                )
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    stringResource(R.string.onboarding_choice_desc),
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(32.dp))
+                Button(onClick = { usePhone = true }) {
+                    Text(stringResource(R.string.onboarding_configure_web))
+                }
+                Spacer(Modifier.height(12.dp))
+                OutlinedButton(onClick = { showChoice = false }) {
+                    Text(stringResource(R.string.onboarding_type_remote))
+                }
+            }
+        }
         return
     }
 
@@ -104,6 +164,9 @@ fun AddSourceScreen(
     var password by remember(existing?.id) { mutableStateOf(existing?.password ?: "") }
     var mac by remember(existing?.id) { mutableStateOf(existing?.macAddress ?: "") }
     var epgUrl by remember(existing?.id) { mutableStateOf(existing?.epgUrl ?: "") }
+    var confUrl by remember { mutableStateOf(ConfigUpdater.getConfUrl(context) ?: "") }
+    var confLoading by remember { mutableStateOf(false) }
+    var confMessage by remember { mutableStateOf<String?>(null) }
     var showAdvanced by remember { mutableStateOf(false) }
     var userAgent by remember(existing?.id) { mutableStateOf(existing?.userAgent ?: Source.DEFAULT_USER_AGENT) }
 
@@ -122,6 +185,8 @@ fun AddSourceScreen(
         epgUrl = epgUrl.takeIf { it.isNotBlank() },
         userAgent = userAgent.ifBlank { Source.DEFAULT_USER_AGENT },
     )
+
+    val confReady = confUrl.isNotBlank() && url.isBlank() && editingSourceId == null
 
     val canSubmit = url.isNotBlank() && when (kind) {
         SourceKind.XTREAM -> username.isNotBlank() && password.isNotBlank()
@@ -264,6 +329,19 @@ fun AddSourceScreen(
                 )
                 Spacer(Modifier.height(12.dp))
                 OutlinedTextField(
+                    value = confUrl,
+                    onValueChange = { confUrl = it },
+                    label = { Text(stringResource(R.string.onboarding_conf_url_optional)) },
+                    supportingText = {
+                        Text(stringResource(R.string.onboarding_conf_url_help))
+                    },
+                    trailingIcon = { PasteButton { confUrl += it } },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
                     value = userAgent,
                     onValueChange = { userAgent = it },
                     label = { Text("User-Agent") },
@@ -298,6 +376,10 @@ fun AddSourceScreen(
                 Text(message, style = MaterialTheme.typography.bodyMedium)
                 Spacer(Modifier.height(12.dp))
             }
+            confMessage?.let { message ->
+                Text(message, style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(12.dp))
+            }
 
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedButton(
@@ -311,19 +393,52 @@ fun AddSourceScreen(
                     }
                 }
                 Button(
-                    onClick = { viewModel.saveAndSync(draft()) { ok -> if (ok) onFinished() } },
-                    enabled = canSubmit && !ui.testing && !ui.syncing,
+                    onClick = {
+                        // Remember (or forget) the conf.json address along with the provider.
+                        ConfigUpdater.saveConfUrl(context, confUrl)
+                        if (confReady) {
+                            // No provider typed, only a conf.json: load what it describes.
+                            confLoading = true
+                            confMessage = null
+                            scope.launch {
+                                val result = ConfigUpdater.refresh(
+                                    context = context,
+                                    existing = ui.sources,
+                                    force = true,
+                                    saveSource = { source ->
+                                        suspendCancellableCoroutine<Boolean> { cont ->
+                                            viewModel.saveAndSync(source) { ok ->
+                                                if (cont.isActive) cont.resume(ok)
+                                            }
+                                        }
+                                    },
+                                )
+                                confLoading = false
+                                when (result) {
+                                    is ConfigUpdater.Result.Updated -> onFinished()
+                                    is ConfigUpdater.Result.Unchanged -> onFinished()
+                                    is ConfigUpdater.Result.Failed -> confMessage =
+                                        context.getString(R.string.onboarding_conf_failed, result.reason)
+                                }
+                            }
+                        } else {
+                            viewModel.saveAndSync(draft()) { ok -> if (ok) onFinished() }
+                        }
+                    },
+                    enabled = (canSubmit || confReady) && !ui.testing && !ui.syncing && !confLoading,
                 ) {
-                    Text(if (ui.syncing) stringResource(R.string.onboarding_working) else stringResource(R.string.onboarding_save_load))
+                    Text(
+                        if (ui.syncing || confLoading) stringResource(R.string.onboarding_working)
+                        else stringResource(R.string.onboarding_save_load),
+                    )
                 }
             }
 
-            // "Set up from your phone" (the QR pairing flow) is offered only on a TV — see the
-            // isTelevision note above. On a phone it would just show a QR to nowhere.
+            // "Configure from the web" is offered only on a TV — see the isTelevision note above.
             if (isTelevision) {
                 Spacer(Modifier.height(20.dp))
                 OutlinedButton(onClick = { usePhone = true }) {
-                    Text(stringResource(R.string.onboarding_use_phone))
+                    Text(stringResource(R.string.onboarding_configure_web))
                 }
             }
 
