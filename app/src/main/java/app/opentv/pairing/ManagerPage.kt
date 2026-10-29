@@ -19,7 +19,7 @@ package app.opentv.pairing
  */
 object ManagerPage {
 
-    fun page(token: String): String = """
+    fun page(): String = """
         <!DOCTYPE html>
         <html lang="en">
         <head>
@@ -141,6 +141,17 @@ object ManagerPage {
               </div>
             </details>
 
+            <details class="rec" id="confCard">
+              <summary>Update from conf.json</summary>
+              <div class="body">
+                <p class="hint">Give the address of a conf.json file (on your home server, for example). OpenTV checks it every time it starts and updates your providers when it changes. If it can't be downloaded, your current providers are kept.</p>
+                <label class="field"><span>conf.json URL</span>
+                  <input id="confUrl" type="url" inputmode="url" placeholder="http://192.168.1.50/conf.json" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+                <button class="save" id="confSave">Save &amp; update now</button>
+                <button class="save" id="confClear" style="background:var(--surface2);border-color:var(--line);margin-left:8px;">Remove</button>
+              </div>
+            </details>
+
             <details class="rec" id="recCard">
               <summary>Recording to NAS (SMB)</summary>
               <div class="body">
@@ -185,9 +196,6 @@ object ManagerPage {
           <div id="status"></div>
 
         <script>
-          var EMBEDDED_TOKEN = "$token";
-          var token = new URLSearchParams(location.search).get('t') || EMBEDDED_TOKEN;
-
           var meta = { sources: [], categories: [] };
           var currentSource = null;   // selected source filter, null = all
           var currentCat = null;      // the category object being viewed
@@ -203,14 +211,13 @@ object ManagerPage {
             statusTimer = setTimeout(function(){ s.className = kind || ''; }, 2600);
           }
 
-          function withToken(path){ return path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(token); }
           async function getJson(path){
-            var r = await fetch(withToken(path));
+            var r = await fetch(path);
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
           }
           async function post(path, bodyObj){
-            var r = await fetch(withToken(path), {
+            var r = await fetch(path, {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify(bodyObj)
             });
@@ -464,6 +471,34 @@ object ManagerPage {
               .catch(function(){ setStatus(UNREACH, 'err'); });
           };
 
+          // ---- conf.json ---------------------------------------------------------------------
+          async function loadConf(){
+            try {
+              var r = await getJson('/conf');
+              el('confUrl').value = r.url || '';
+              if (r.url) el('confCard').open = true;
+            } catch (e) { /* leave the field blank if the TV can't be reached yet */ }
+          }
+          el('confSave').onclick = function(){
+            var url = el('confUrl').value.trim();
+            if (!url) { setStatus('Enter the conf.json address.', 'err'); return; }
+            if (!/^https?:\/\//i.test(url)) { setStatus('The address must start with http:// or https://', 'err'); return; }
+            setStatus('Saving & downloading…');
+            post('/conf', { url: url })
+              .then(function(r){
+                if (r && r.ok) {
+                  setStatus(r.updated ? ('Updated — ' + r.updated + ' provider(s) loaded.') : 'Saved — already up to date.', 'ok');
+                  loadMeta();
+                } else setStatus("Couldn't load conf.json: " + ((r && r.error) || 'check the address'), 'err');
+              })
+              .catch(function(){ setStatus(UNREACH, 'err'); });
+          };
+          el('confClear').onclick = function(){
+            post('/conf', { url: '' })
+              .then(function(){ el('confUrl').value = ''; setStatus('conf.json removed.', 'ok'); })
+              .catch(function(){ setStatus(UNREACH, 'err'); });
+          };
+
           // ---- Add a provider ----------------------------------------------------------------
           function provType(){ return el('provKind').value; }
           function syncProvFields(){
@@ -512,6 +547,7 @@ object ManagerPage {
 
           loadMeta();
           loadRecording();
+          loadConf();
         </script>
         </body>
         </html>
