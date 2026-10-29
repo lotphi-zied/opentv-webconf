@@ -5,7 +5,9 @@
  */
 package app.opentv.pairing
 
+import android.content.Context
 import android.util.Log
+import app.opentv.config.ConfigUpdater
 import app.opentv.core.AppSettings
 import app.opentv.data.model.Channel
 import app.opentv.data.model.Source
@@ -19,10 +21,10 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
-import java.security.SecureRandom
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
 import kotlinx.coroutines.CoroutineScope
@@ -47,21 +49,21 @@ import kotlinx.serialization.json.Json
  * instead of a D-pad — and browses, hides, favourites, renames and reorders channels. Every change
  * writes straight to this device's database. It works with the internet unplugged.
  *
- * ## What stops the neighbours using it
+ * ## Access
  *
- * - Binds to the LAN on a **random high port**, and only while the manage screen is open.
- * - The URL carries a **random token**; every route checks it. Knowing the IP and port is not
- *   enough. The token is only ever shown on the TV (QR + link), so only someone who can see the
- *   telly can connect — which is the whole security model. It is kept short enough to type, because
- *   the TV shows the full URL (with the token) as a fallback for when the QR won't scan; a LAN-only,
- *   private-IP-only, idle-closing server on a random port doesn't need more. Unlike pairing there is
- *   no six-digit code, because this handles no credentials and the point is to be frictionless.
+ * The page is open to anyone on the local network: the address is simply
+ * `http://<tv-ip>:<port>/`, with no token. What remains:
+ *
+ * - Binds to the LAN, and only while the manage screen is open.
+ * - The first free port of [PORTS] is used (9090, 1234, 8080, 8888); only if all four are busy
+ *   does the system pick one.
  * - Requests from non-private addresses are refused outright.
  * - Request bodies are capped ([MAX_BODY_BYTES]).
  * - Unlike pairing (which closes after the first submit) this keeps serving while the screen is
  *   open, and only closes itself after [IDLE_TIMEOUT_MINUTES] with no requests, or on [stop].
  */
 class ManagerServer(
+    private val context: Context,
     private val scope: CoroutineScope,
     private val catalog: CatalogRepository,
     private val settings: AppSettings,
@@ -69,7 +71,7 @@ class ManagerServer(
 ) {
 
     data class Session(
-        /** What the QR code encodes, e.g. `http://192.168.0.14:41234/?t=…` */
+        /** What the QR code encodes, e.g. `http://192.168.0.14:9090/` */
         val url: String,
         val host: String,
         val port: Int,
@@ -88,7 +90,6 @@ class ManagerServer(
     val state: StateFlow<State> = _state.asStateFlow()
 
     private var serverSocket: ServerSocket? = null
-    private var token: String = ""
     @Volatile private var running = false
     @Volatile private var lastActivityMillis = 0L
 
@@ -104,20 +105,8 @@ class ManagerServer(
             return
         }
 
-        val random = SecureRandom()
-        // A short token, not a long one, so the "camera won't scan the QR?" fallback URL the TV
-        // shows is actually typeable into a laptop browser. It only gates a LAN-only, private-IP-only
-        // server on a random high port that closes on idle and is shown solely on this TV screen, so
-        // ~40 bits is ample — brute-forcing it on the local network inside the session window isn't
-        // realistic.
-        token = ByteArray(5).also(random::nextBytes).joinToString("") { "%02x".format(it) }
-
-        val socket = try {
-            // Port 0 asks the OS for a free one. A fixed port would be predictable and would
-            // clash with whatever else the user runs at home.
-            ServerSocket(0)
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not open a socket", e)
+        val socket = openSocket()
+        if (socket == null) {
             _state.value = State.Failed("Could not start the channel manager on this device.")
             return
         }
@@ -128,7 +117,7 @@ class ManagerServer(
 
         _state.value = State.Listening(
             Session(
-                url = "http://$host:${socket.localPort}/?t=$token",
+                url = "http://$host:${socket.localPort}/",
                 host = host,
                 port = socket.localPort,
             ),
@@ -170,7 +159,6 @@ class ManagerServer(
         running = false
         runCatching { serverSocket?.close() }
         serverSocket = null
-        token = ""
         if (_state.value is State.Listening) _state.value = State.Idle
     }
 
@@ -199,21 +187,14 @@ class ManagerServer(
 
         val output = client.getOutputStream()
 
-        // Every route checks the token. Without it, none of this exists.
-        val supplied = query["t"] ?: ""
-        if (token.isEmpty() || !PairingHttp.secretsMatch(supplied, token)) {
-            output.write(PairingHttp.httpResponse("404 Not Found", "text/plain", "Not found."))
-            return
-        }
-
-        // A valid request counts as activity; the idle watchdog measures from here.
+        // Any request counts as activity; the idle watchdog measures from here.
         lastActivityMillis = System.currentTimeMillis()
 
         val body = if (method == "POST") readBody(reader, headers) else ""
 
         when {
             method == "GET" && path == "/" ->
-                output.write(PairingHttp.httpResponse("200 OK", "text/html", ManagerPage.page(token)))
+                output.write(PairingHttp.httpResponse("200 OK", "text/html", ManagerPage.page()))
 
             method == "GET" && path == "/meta" ->
                 output.write(PairingHttp.httpResponse("200 OK", "application/json", metaJson()))
@@ -236,17 +217,27 @@ class ManagerServer(
 
             method == "POST" && path == "/source/test" -> handleTestSource(output, body)
 
+            method == "GET" && path == "/conf" ->
+                writeJson(output, ConfDto.serializer(), ConfDto(url = ConfigUpdater.getConfUrl(context)))
+
+            method == "POST" && path == "/conf" -> handleConf(output, body)
+
             else -> output.write(PairingHttp.httpResponse("404 Not Found", "text/plain", "Not found."))
         }
     }
 
     private fun readBody(reader: BufferedReader, headers: Map<String, String>): String {
         val contentLength = (headers["content-length"]?.toIntOrNull() ?: 0)
-            .coerceAtMost(MAX_BODY_BYTES)
+            .coerceIn(0, MAX_BODY_BYTES)
         if (contentLength <= 0) return ""
         val buffer = CharArray(contentLength)
-        val read = reader.read(buffer, 0, contentLength)
-        return if (read > 0) String(buffer, 0, read) else ""
+        var total = 0
+        while (total < contentLength) {
+            val read = reader.read(buffer, total, contentLength - total)
+            if (read < 0) break
+            total += read
+        }
+        return String(buffer, 0, total)
     }
 
     // ---- Routes --------------------------------------------------------------------------------
@@ -372,6 +363,59 @@ class ManagerServer(
         output.write(PairingHttp.httpResponse("200 OK", "application/json", json.encodeToString(TestDto.serializer(), dto)))
     }
 
+    // ---- conf.json -----------------------------------------------------------------------------
+
+    /**
+     * `POST /conf {url}` → remember the address of a `conf.json` and apply it right away.
+     * A blank url forgets the address. The same file is re-checked at every app launch
+     * (see [ConfigUpdater]); a failed download leaves the existing providers untouched.
+     */
+    private fun handleConf(output: OutputStream, body: String) {
+        val req = runCatching { json.decodeFromString(ConfReq.serializer(), body) }.getOrNull()
+        if (req == null) {
+            output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
+            return
+        }
+
+        val raw = req.url.trim()
+        if (raw.isEmpty()) {
+            ConfigUpdater.saveConfUrl(context, null)
+            writeJson(output, ConfResultDto.serializer(), ConfResultDto(ok = true))
+            return
+        }
+
+        val url = PairingHttp.cleanHttpUrl(raw)
+        if (url == null) {
+            writeJson(
+                output,
+                ConfResultDto.serializer(),
+                ConfResultDto(ok = false, error = "The address must start with http:// or https://."),
+            )
+            return
+        }
+
+        ConfigUpdater.saveConfUrl(context, url)
+        val result = runBlocking {
+            ConfigUpdater.refresh(
+                context = context,
+                existing = catalog.enabledSources(),
+                force = true,
+                saveSource = { source ->
+                    val id = sourceRepository.save(source)
+                    val saved = sourceRepository.byId(id)
+                    saved != null &&
+                        catalog.syncLive(saved, System.currentTimeMillis()) is CatalogRepository.SyncResult.Success
+                },
+            )
+        }
+        val dto = when (result) {
+            is ConfigUpdater.Result.Updated -> ConfResultDto(ok = true, updated = result.count)
+            is ConfigUpdater.Result.Unchanged -> ConfResultDto(ok = true)
+            is ConfigUpdater.Result.Failed -> ConfResultDto(ok = false, error = result.reason)
+        }
+        writeJson(output, ConfResultDto.serializer(), dto)
+    }
+
     // ---- Add a provider ------------------------------------------------------------------------
 
     /**
@@ -448,6 +492,33 @@ class ManagerServer(
         number = number,
     )
 
+    // ---- Port selection ------------------------------------------------------------------------
+
+    /**
+     * Opens the first free port of [PORTS]; only when all of them are taken does the system pick
+     * one (port 0). The address shown on the TV is built from the port actually bound.
+     */
+    private fun openSocket(): ServerSocket? {
+        for (port in PORTS) {
+            val candidate = try {
+                ServerSocket().apply {
+                    reuseAddress = true
+                    bind(InetSocketAddress(port))
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Port $port unavailable", e)
+                null
+            }
+            if (candidate != null) return candidate
+        }
+        return try {
+            ServerSocket(0)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not open a socket", e)
+            null
+        }
+    }
+
     // ---- Finding our own address ---------------------------------------------------------------
 
     /**
@@ -481,6 +552,9 @@ class ManagerServer(
 
     private companion object {
         const val TAG = "ManagerServer"
+
+        /** Tried in this order; the first free one wins, then the system picks. */
+        val PORTS = intArrayOf(9090, 1234, 8080, 8888)
         const val SOCKET_TIMEOUT_MILLIS = 15_000
         const val IDLE_TIMEOUT_MINUTES = 30L
 
@@ -551,5 +625,11 @@ class ManagerServer(
 )
 
 @Serializable private data class AddResultDto(val ok: Boolean, val channels: Int = 0, val error: String? = null)
+
+@Serializable private data class ConfReq(val url: String = "")
+
+@Serializable private data class ConfDto(val url: String? = null)
+
+@Serializable private data class ConfResultDto(val ok: Boolean, val updated: Int = 0, val error: String? = null)
 
 @Serializable private data class TestResultDto(val ok: Boolean, val message: String? = null, val error: String? = null)
