@@ -206,6 +206,8 @@ class ManagerServer(
 
             method == "POST" && path == "/reorder" -> handleReorder(output, body)
 
+            method == "POST" && path == "/bulk" -> handleBulk(output, body)
+
             method == "GET" && path == "/recording" ->
                 output.write(PairingHttp.httpResponse("200 OK", "application/json", recordingJson()))
 
@@ -302,6 +304,42 @@ class ManagerServer(
             req.ids.forEachIndexed { index, id -> if (id > 0L) catalog.setChannelSortIndex(id, index) }
         }
         writeOk(output)
+    }
+
+    /**
+     * `POST /bulk {cat, source?, hidden?|favourite?}` → apply the given field(s) to **every** channel
+     * of one category: show all / hide all / favourite all / unfavourite all. The same call serves
+     * the category list (hide or show a whole category without opening it) and the channel list.
+     * Rows already in the requested state are skipped, and the reply says how many actually changed.
+     */
+    private fun handleBulk(output: OutputStream, body: String) {
+        val req = runCatching { json.decodeFromString(BulkReq.serializer(), body) }.getOrNull()
+        if (req == null || req.cat.isBlank() || (req.hidden == null && req.favourite == null)) {
+            output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
+            return
+        }
+        val result = runBlocking {
+            val rows = catalog.channelsInCategoryForManager(req.source, req.cat)
+            var changed = 0
+            rows.forEach { channel ->
+                var touched = false
+                req.hidden?.let { wanted ->
+                    if (channel.hidden != wanted) {
+                        catalog.setChannelHidden(channel.id, wanted)
+                        touched = true
+                    }
+                }
+                req.favourite?.let { wanted ->
+                    if (channel.favourite != wanted) {
+                        catalog.setChannelFavourite(channel.id, wanted)
+                        touched = true
+                    }
+                }
+                if (touched) changed++
+            }
+            BulkResultDto(ok = true, changed = changed, total = rows.size)
+        }
+        writeJson(output, BulkResultDto.serializer(), result)
     }
 
     private fun writeOk(output: OutputStream) {
@@ -595,6 +633,15 @@ class ManagerServer(
 )
 
 @Serializable private data class ReorderReq(val ids: List<Long>)
+
+@Serializable private data class BulkReq(
+    val cat: String = "",
+    val source: Long? = null,
+    val hidden: Boolean? = null,
+    val favourite: Boolean? = null,
+)
+
+@Serializable private data class BulkResultDto(val ok: Boolean, val changed: Int = 0, val total: Int = 0)
 
 @Serializable private data class RecordingDto(
     val target: String,
