@@ -53,6 +53,15 @@ object ManagerPage {
           .cat .label { flex:1; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
           .cat .count { color:var(--muted); font-size:.85rem; font-variant-numeric:tabular-nums; }
           .cat .chev { color:var(--muted); }
+          .cat.off { opacity:.55; }
+          .cat .mini { width:36px; height:36px; flex:none; display:flex; align-items:center; justify-content:center;
+                       font-size:16px; border-radius:9px; cursor:pointer; user-select:none;
+                       background:var(--surface2); border:1px solid var(--line); color:var(--muted); }
+          .cat .mini:active { transform:scale(.92); }
+          .tools { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 14px; }
+          .tool { padding:9px 13px; font-size:.88rem; font-weight:600; border-radius:10px; cursor:pointer;
+                  user-select:none; background:var(--surface); border:1px solid var(--line); color:var(--text); }
+          .tool:active { transform:scale(.97); }
           .row { display:flex; align-items:center; gap:11px; padding:10px 12px;
                  background:var(--surface); border:1px solid var(--line); border-radius:12px; }
           .row.hidden { opacity:.55; }
@@ -182,7 +191,13 @@ object ManagerPage {
             <section id="chanView" hidden>
               <div id="back" class="back">&#8249;&nbsp;Categories</div>
               <h2 id="chanHead" class="chanhead"></h2>
-              <p class="hint" id="chanHint">Tap a name to rename. Star to favourite, eye to hide, arrows to reorder.</p>
+              <p class="hint" id="chanHint">Tap a name to rename. Star to favourite, eye to hide, arrows to reorder. Use the buttons below to act on the whole category.</p>
+              <div class="tools" id="chanTools">
+                <div class="tool" id="bulkShow">&#128065;&nbsp;Show all</div>
+                <div class="tool" id="bulkHide">&#128584;&nbsp;Hide all</div>
+                <div class="tool" id="bulkFav">&#9733;&nbsp;Favourite all</div>
+                <div class="tool" id="bulkUnfav">&#9734;&nbsp;Unfavourite all</div>
+              </div>
               <div id="chanList" class="list"></div>
               <div id="chanEmpty" class="empty" hidden></div>
             </section>
@@ -272,20 +287,54 @@ object ManagerPage {
             empty.hidden = true;
             cats.forEach(function(c){
               var row = document.createElement('div');
-              row.className = 'cat';
+              row.className = 'cat' + (c.bulk === 'hidden' ? ' off' : '');
               var label = document.createElement('span'); label.className = 'label'; label.textContent = c.label;
               var count = document.createElement('span'); count.className = 'count'; count.textContent = c.count;
               var chev = document.createElement('span'); chev.className = 'chev'; chev.innerHTML = '&#8250;';
-              row.appendChild(label); row.appendChild(count); row.appendChild(chev);
+              var showAll = document.createElement('span'); showAll.className = 'mini';
+              showAll.innerHTML = '&#128065;'; showAll.title = 'Show the whole category';
+              showAll.onclick = function(e){
+                e.stopPropagation();
+                bulk(c, { hidden: false }, 'Showing the whole category').then(function(r){
+                  if (r) { c.bulk = 'shown'; row.className = 'cat'; }
+                });
+              };
+              var hideAll = document.createElement('span'); hideAll.className = 'mini';
+              hideAll.innerHTML = '&#128584;'; hideAll.title = 'Hide the whole category';
+              hideAll.onclick = function(e){
+                e.stopPropagation();
+                if (!confirm('Hide all ' + c.count + ' channels in "' + c.label + '"?')) return;
+                bulk(c, { hidden: true }, 'Category hidden').then(function(r){
+                  if (r) { c.bulk = 'hidden'; row.className = 'cat off'; }
+                });
+              };
+              row.appendChild(label); row.appendChild(count); row.appendChild(showAll); row.appendChild(hideAll); row.appendChild(chev);
               row.onclick = function(){ openCategory(c); };
               list.appendChild(row);
             });
           }
           el('catSearch').addEventListener('input', renderCategories);
 
+          // ---- Bulk actions ------------------------------------------------------------------
+          // One call applies a change to every channel of a category. Resolves to the reply, or to
+          // null after showing an error, so callers only update the page on success.
+          function bulk(cat, patch, label){
+            var body = { cat: cat.id, source: cat.sourceId };
+            for (var k in patch) body[k] = patch[k];
+            setStatus('Working…');
+            return post('/bulk', body)
+              .then(function(r){
+                if (!(r && r.ok)) { setStatus("Couldn't apply that.", 'err'); return null; }
+                setStatus(label + ' — ' + r.changed + (r.changed === 1 ? ' channel' : ' channels') + ' updated', 'ok');
+                return r;
+              })
+              .catch(function(){ setStatus(UNREACH, 'err'); return null; });
+          }
+
           // ---- Channels ----------------------------------------------------------------------
           async function openCategory(cat){
             currentCat = cat;
+            delete cat.bulk;   // individual toggles below make any whole-category state stale
             el('catView').hidden = true;
             el('chanView').hidden = false;
             el('chanHead').textContent = cat.label;
@@ -304,6 +353,26 @@ object ManagerPage {
             el('chanView').hidden = true;
             el('catView').hidden = false;
             channels = [];
+          };
+
+          function bulkChannels(patch, label){
+            if (!currentCat || !channels.length) return;
+            bulk(currentCat, patch, label).then(function(r){
+              if (!r) return;
+              channels.forEach(function(c){
+                if ('hidden' in patch) c.hidden = patch.hidden;
+                if ('favourite' in patch) c.favourite = patch.favourite;
+              });
+              renderChannels();
+            });
+          }
+          el('bulkShow').onclick = function(){ bulkChannels({ hidden: false }, 'Showing all'); };
+          el('bulkHide').onclick = function(){
+            if (confirm('Hide all ' + channels.length + ' channels in this category?')) bulkChannels({ hidden: true }, 'Hidden');
+          };
+          el('bulkFav').onclick = function(){ bulkChannels({ favourite: true }, 'All favourited'); };
+          el('bulkUnfav').onclick = function(){
+            if (confirm('Remove all ' + channels.length + ' channels of this category from your favourites?')) bulkChannels({ favourite: false }, 'Favourites cleared');
           };
 
           function renderChannels(){
