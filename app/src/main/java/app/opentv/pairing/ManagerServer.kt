@@ -11,6 +11,8 @@ import app.opentv.config.ConfigUpdater
 import app.opentv.core.AppSettings
 import app.opentv.data.model.Channel
 import app.opentv.data.model.Source
+import app.opentv.data.model.StreamKind
+import app.opentv.data.parser.displayTitle
 import app.opentv.data.model.SourceKind
 import app.opentv.data.model.shownName
 import app.opentv.data.repo.CatalogRepository
@@ -208,6 +210,16 @@ class ManagerServer(
 
             method == "POST" && path == "/bulk" -> handleBulk(output, body)
 
+            method == "GET" && path == "/vod/meta" ->
+                output.write(PairingHttp.httpResponse("200 OK", "application/json", vodMetaJson(query)))
+
+            method == "GET" && path == "/vod/items" ->
+                output.write(PairingHttp.httpResponse("200 OK", "application/json", vodItemsJson(query)))
+
+            method == "POST" && path == "/vod/item" -> handleVodItem(output, body)
+
+            method == "POST" && path == "/vod/bulk" -> handleVodBulk(output, body)
+
             method == "GET" && path == "/recording" ->
                 output.write(PairingHttp.httpResponse("200 OK", "application/json", recordingJson()))
 
@@ -244,12 +256,13 @@ class ManagerServer(
 
     // ---- Routes --------------------------------------------------------------------------------
 
-    /** `{ sources:[{id,name}], categories:[{id,label,sourceId,count}] }` */
+    /** `{ sources:[{id,name}], categories:[{id,label,sourceId,count,hidden}] }` */
     private fun metaJson(): String = runBlocking {
         val sources = catalog.enabledSources()
         val sourceIds = sources.map { it.id }.toSet()
         val counts = catalog.categoryChannelCounts()
             .associateBy({ it.sourceId to it.categoryId }, { it.count })
+        val hiddenCounts = catalog.hiddenChannelCountsByCategory()
         // Only categories that belong to an enabled source AND actually hold channels — an empty
         // category is noise on a phone, and a category count includes hidden rows so it stays > 0
         // for a category whose channels are all hidden (which is exactly what you'd browse to fix).
@@ -258,7 +271,13 @@ class ManagerServer(
             .mapNotNull { cat ->
                 val count = counts[cat.sourceId to cat.id] ?: 0
                 if (count <= 0) null
-                else CategoryDto(id = cat.id, label = cat.name, sourceId = cat.sourceId, count = count)
+                else CategoryDto(
+                    id = cat.id,
+                    label = cat.name,
+                    sourceId = cat.sourceId,
+                    count = count,
+                    hidden = hiddenCounts[cat.sourceId to cat.id] ?: 0,
+                )
             }
         json.encodeToString(
             MetaDto.serializer(),
@@ -306,11 +325,13 @@ class ManagerServer(
         writeOk(output)
     }
 
+    // ---- Bulk actions ---------------------------------------------------------------------------
+
     /**
      * `POST /bulk {cat, source?, hidden?|favourite?}` → apply the given field(s) to **every** channel
-     * of one category: show all / hide all / favourite all / unfavourite all. The same call serves
-     * the category list (hide or show a whole category without opening it) and the channel list.
-     * Rows already in the requested state are skipped, and the reply says how many actually changed.
+     * of one category: show all / hide all / favourite all / unfavourite all. Each is a single SQL
+     * statement (see [CatalogRepository.setCategoryHidden]), so it is instant even for a category of
+     * thousands. Serves both the category list and the channel list. Replies with how many changed.
      */
     private fun handleBulk(output: OutputStream, body: String) {
         val req = runCatching { json.decodeFromString(BulkReq.serializer(), body) }.getOrNull()
@@ -318,28 +339,101 @@ class ManagerServer(
             output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
             return
         }
-        val result = runBlocking {
-            val rows = catalog.channelsInCategoryForManager(req.source, req.cat)
-            var changed = 0
-            rows.forEach { channel ->
-                var touched = false
-                req.hidden?.let { wanted ->
-                    if (channel.hidden != wanted) {
-                        catalog.setChannelHidden(channel.id, wanted)
-                        touched = true
-                    }
-                }
-                req.favourite?.let { wanted ->
-                    if (channel.favourite != wanted) {
-                        catalog.setChannelFavourite(channel.id, wanted)
-                        touched = true
-                    }
-                }
-                if (touched) changed++
-            }
-            BulkResultDto(ok = true, changed = changed, total = rows.size)
+        val changed = runBlocking {
+            var n = 0
+            req.hidden?.let { n += catalog.setCategoryHidden(req.source, req.cat, it) }
+            req.favourite?.let { n += catalog.setCategoryFavourite(req.source, req.cat, it) }
+            n
         }
-        writeJson(output, BulkResultDto.serializer(), result)
+        writeJson(output, BulkResultDto.serializer(), BulkResultDto(ok = true, changed = changed))
+    }
+
+    // ---- VOD: hide / show movies and series -----------------------------------------------------
+
+    private fun vodKind(raw: String?): StreamKind? = when (raw) {
+        "movie" -> StreamKind.MOVIE
+        "series" -> StreamKind.SERIES
+        else -> null
+    }
+
+    /** `GET /vod/meta?kind=movie|series` → same shape as `/meta`, for the VOD categories. */
+    private fun vodMetaJson(query: Map<String, String>): String = runBlocking {
+        val kind = vodKind(query["kind"])
+            ?: return@runBlocking json.encodeToString(MetaDto.serializer(), MetaDto(emptyList(), emptyList()))
+        val sources = catalog.enabledSources()
+        val sourceIds = sources.map { it.id }.toSet()
+        val counts = catalog.vodCategoryCounts(kind).associateBy({ it.sourceId to it.categoryId }, { it.count })
+        val hiddenCounts = catalog.vodHiddenCounts(kind).associateBy({ it.sourceId to it.categoryId }, { it.count })
+        val categories = catalog.vodCategories(kind)
+            .filter { it.sourceId in sourceIds }
+            .mapNotNull { cat ->
+                val count = counts[cat.sourceId to cat.id] ?: 0
+                if (count <= 0) null
+                else CategoryDto(
+                    id = cat.id,
+                    label = cat.name,
+                    sourceId = cat.sourceId,
+                    count = count,
+                    hidden = hiddenCounts[cat.sourceId to cat.id] ?: 0,
+                )
+            }
+        json.encodeToString(
+            MetaDto.serializer(),
+            MetaDto(sources = sources.map { SourceDto(it.id, it.name) }, categories = categories),
+        )
+    }
+
+    /** `GET /vod/items?kind=movie|series&cat=<id>[&source=<id>]` → the category's titles, hidden included. */
+    private fun vodItemsJson(query: Map<String, String>): String = runBlocking {
+        val serializer = ListSerializer(VodItemDto.serializer())
+        val kind = vodKind(query["kind"])
+        val cat = query["cat"]
+        if (kind == null || cat.isNullOrBlank()) return@runBlocking json.encodeToString(serializer, emptyList())
+        val source = query["source"]?.toLongOrNull()
+        val rows = when (kind) {
+            StreamKind.MOVIE -> catalog.moviesInCategoryForManager(source, cat)
+                .map { VodItemDto(it.id, it.displayTitle, it.posterUrl, it.year, it.hidden) }
+            StreamKind.SERIES -> catalog.seriesInCategoryForManager(source, cat)
+                .map { VodItemDto(it.id, it.displayTitle, it.posterUrl, it.year, it.hidden) }
+            StreamKind.LIVE -> emptyList()
+        }
+        json.encodeToString(serializer, rows)
+    }
+
+    /** `POST /vod/item {kind, id, hidden}` → hide or show one movie or series. */
+    private fun handleVodItem(output: OutputStream, body: String) {
+        val req = runCatching { json.decodeFromString(VodItemReq.serializer(), body) }.getOrNull()
+        val kind = vodKind(req?.kind)
+        if (req == null || kind == null || req.id <= 0L) {
+            output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
+            return
+        }
+        runBlocking {
+            when (kind) {
+                StreamKind.MOVIE -> catalog.setMovieHidden(req.id, req.hidden)
+                StreamKind.SERIES -> catalog.setSeriesHidden(req.id, req.hidden)
+                StreamKind.LIVE -> Unit
+            }
+        }
+        writeOk(output)
+    }
+
+    /** `POST /vod/bulk {kind, cat, source?, hidden}` → hide or show every title of a category. */
+    private fun handleVodBulk(output: OutputStream, body: String) {
+        val req = runCatching { json.decodeFromString(VodBulkReq.serializer(), body) }.getOrNull()
+        val kind = vodKind(req?.kind)
+        if (req == null || kind == null || req.cat.isBlank() || req.hidden == null) {
+            output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
+            return
+        }
+        val changed = runBlocking {
+            when (kind) {
+                StreamKind.MOVIE -> catalog.setMovieCategoryHidden(req.source, req.cat, req.hidden)
+                StreamKind.SERIES -> catalog.setSeriesCategoryHidden(req.source, req.cat, req.hidden)
+                StreamKind.LIVE -> 0
+            }
+        }
+        writeJson(output, BulkResultDto.serializer(), BulkResultDto(ok = true, changed = changed))
     }
 
     private fun writeOk(output: OutputStream) {
@@ -610,7 +704,13 @@ class ManagerServer(
 
 @Serializable private data class SourceDto(val id: Long, val name: String)
 
-@Serializable private data class CategoryDto(val id: String, val label: String, val sourceId: Long, val count: Int)
+@Serializable private data class CategoryDto(
+    val id: String,
+    val label: String,
+    val sourceId: Long,
+    val count: Int,
+    val hidden: Int = 0,
+)
 
 @Serializable private data class ChannelDto(
     val id: Long,
@@ -641,7 +741,24 @@ class ManagerServer(
     val favourite: Boolean? = null,
 )
 
-@Serializable private data class BulkResultDto(val ok: Boolean, val changed: Int = 0, val total: Int = 0)
+@Serializable private data class BulkResultDto(val ok: Boolean, val changed: Int = 0)
+
+@Serializable private data class VodItemDto(
+    val id: Long,
+    val name: String,
+    val poster: String? = null,
+    val year: Int? = null,
+    val hidden: Boolean = false,
+)
+
+@Serializable private data class VodItemReq(val kind: String = "", val id: Long = 0, val hidden: Boolean = false)
+
+@Serializable private data class VodBulkReq(
+    val kind: String = "",
+    val cat: String = "",
+    val source: Long? = null,
+    val hidden: Boolean? = null,
+)
 
 @Serializable private data class RecordingDto(
     val target: String,
