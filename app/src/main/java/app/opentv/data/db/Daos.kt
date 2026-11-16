@@ -604,6 +604,7 @@ interface MovieDao {
     suspend fun hiddenCountsByCategory(): List<CategoryChannelCount>
 }
 
+@Dao
 interface SeriesDao {
     @Query(
         """
@@ -722,6 +723,7 @@ interface SeriesDao {
     suspend fun hiddenCountsByCategory(): List<CategoryChannelCount>
 }
 
+@Dao
 interface EpisodeDao {
     @Query("SELECT * FROM episodes WHERE sourceId = :sourceId AND seriesId = :seriesId ORDER BY season, episodeNumber")
     fun observeForSeries(sourceId: Long, seriesId: String): Flow<List<Episode>>
