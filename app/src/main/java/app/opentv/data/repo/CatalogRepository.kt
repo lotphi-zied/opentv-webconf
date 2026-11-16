@@ -585,6 +585,62 @@ class CatalogRepository(
     suspend fun channelsInCategoryForManager(sourceId: Long?, categoryId: String): List<Channel> =
         channelDao.channelsInCategoryIncludingHidden(sourceId, categoryId)
 
+    // --- Whole-category actions on channels (one SQL statement each) ---------------------------------
+
+    /** Hides or shows every channel of one category. Returns how many rows actually changed. */
+    suspend fun setCategoryHidden(sourceId: Long?, categoryId: String, hidden: Boolean): Int =
+        channelDao.setHiddenInCategory(sourceId, categoryId, hidden)
+
+    /** Adds or removes every channel of one category from the favourites. Returns rows changed. */
+    suspend fun setCategoryFavourite(sourceId: Long?, categoryId: String, favourite: Boolean): Int =
+        channelDao.setFavouriteInCategory(sourceId, categoryId, favourite)
+
+    /** Number of hidden channels per (source, category) — lets a category show "12 of 340 hidden". */
+    suspend fun hiddenChannelCountsByCategory(): Map<Pair<Long, String>, Int> =
+        channelDao.hiddenCountsByCategory().associateBy({ it.sourceId to it.categoryId }, { it.count })
+
+    // --- VOD filtering: hide / show movies and series, singly or a whole category -------------------
+    // Hidden titles disappear from rows, grids, search and recommendations (see the `hidden = 0`
+    // filters in MovieDao / SeriesDao) but stay reachable by id, so an open detail page or a resume
+    // position keeps working.
+
+    /** Every category of a kind (live, movie or series), raw, for the web manager. */
+    suspend fun vodCategories(kind: StreamKind): List<Category> = categoryDao.allByKind(kind)
+
+    /** Title count per (source, category), hidden included. */
+    suspend fun vodCategoryCounts(kind: StreamKind): List<app.opentv.data.db.CategoryChannelCount> =
+        when (kind) {
+            StreamKind.MOVIE -> movieDao.countsByCategory()
+            StreamKind.SERIES -> seriesDao.countsByCategory()
+            StreamKind.LIVE -> channelDao.channelCountsByCategory()
+        }
+
+    /** Hidden-title count per (source, category). */
+    suspend fun vodHiddenCounts(kind: StreamKind): List<app.opentv.data.db.CategoryChannelCount> =
+        when (kind) {
+            StreamKind.MOVIE -> movieDao.hiddenCountsByCategory()
+            StreamKind.SERIES -> seriesDao.hiddenCountsByCategory()
+            StreamKind.LIVE -> channelDao.hiddenCountsByCategory()
+        }
+
+    suspend fun moviesInCategoryForManager(sourceId: Long?, categoryId: String): List<Movie> =
+        movieDao.inCategoryIncludingHidden(sourceId, categoryId)
+
+    suspend fun seriesInCategoryForManager(sourceId: Long?, categoryId: String): List<Series> =
+        seriesDao.inCategoryIncludingHidden(sourceId, categoryId)
+
+    suspend fun setMovieHidden(id: Long, hidden: Boolean) = movieDao.setHidden(id, hidden)
+
+    suspend fun setSeriesHidden(id: Long, hidden: Boolean) = seriesDao.setHidden(id, hidden)
+
+    /** Hides or shows every movie of one category. Returns how many rows actually changed. */
+    suspend fun setMovieCategoryHidden(sourceId: Long?, categoryId: String, hidden: Boolean): Int =
+        movieDao.setHiddenInCategory(sourceId, categoryId, hidden)
+
+    /** Hides or shows every series of one category. Returns how many rows actually changed. */
+    suspend fun setSeriesCategoryHidden(sourceId: Long?, categoryId: String, hidden: Boolean): Int =
+        seriesDao.setHiddenInCategory(sourceId, categoryId, hidden)
+
     suspend fun setMovieFavourite(id: Long, favourite: Boolean) =
         movieDao.setFavourite(id, favourite)
 
