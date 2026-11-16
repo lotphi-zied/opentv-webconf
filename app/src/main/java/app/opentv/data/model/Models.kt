@@ -293,6 +293,12 @@ data class Movie(
     val tmdbId: String? = null,
     /** Director(s), provider-formatted. Movies only. */
     val director: String? = null,
+    /**
+     * Hidden by the user from every browse surface (rows, grids, search, recommendations) — the VOD
+     * counterpart of [Channel.hidden]. Still reachable by id so an open detail page or a resume
+     * position keeps working. Default 0 matches the v11 → v12 migration.
+     */
+    @ColumnInfo(defaultValue = "0") val hidden: Boolean = false,
 )
 
 @Entity(
@@ -327,6 +333,8 @@ data class Series(
     val genre: String? = null,
     /** TMDB id, stored only — resolved/used by a later agent. Coerced to String (panels vary). */
     val tmdbId: String? = null,
+    /** Hidden by the user from every browse surface. See [Movie.hidden]. */
+    @ColumnInfo(defaultValue = "0") val hidden: Boolean = false,
 )
 
 @Entity(
