@@ -189,6 +189,43 @@ interface ChannelDao {
     @Query("UPDATE channels SET hidden = :hidden WHERE id = :id")
     suspend fun setHidden(id: Long, hidden: Boolean)
 
+    /**
+     * Hides or shows every channel of one category (optionally scoped to one source) in a single
+     * statement, instead of one write per channel. Rows already in the requested state are left
+     * alone; returns how many actually changed.
+     */
+    @Query(
+        """
+        UPDATE channels SET hidden = :hidden
+        WHERE categoryId = :categoryId
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND hidden != :hidden
+        """
+    )
+    suspend fun setHiddenInCategory(sourceId: Long?, categoryId: String, hidden: Boolean): Int
+
+    /** Adds or removes every channel of one category from the favourites. See [setHiddenInCategory]. */
+    @Query(
+        """
+        UPDATE channels SET favourite = :favourite
+        WHERE categoryId = :categoryId
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND favourite != :favourite
+        """
+    )
+    suspend fun setFavouriteInCategory(sourceId: Long?, categoryId: String, favourite: Boolean): Int
+
+    /** Hidden-channel count per (source, category) — lets a category show "12 of 340 hidden". */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM channels
+        WHERE categoryId IS NOT NULL AND hidden = 1
+        GROUP BY sourceId, categoryId
+        """
+    )
+    suspend fun hiddenCountsByCategory(): List<CategoryChannelCount>
+
     @Query("UPDATE channels SET customName = :name WHERE id = :id")
     suspend fun setCustomName(id: Long, name: String?)
 
@@ -311,7 +348,7 @@ interface CategoryDao {
 /** Projection for [CategoryDao.namesFor]. */
 data class CategoryName(val id: String, val name: String)
 
-/** Projection for [ChannelDao.channelCountsByCategory]. */
+/** Projection for the per-category counts of channels, movies and series (total and hidden). */
 data class CategoryChannelCount(val sourceId: Long, val categoryId: String, val count: Int)
 
 @Dao
@@ -423,20 +460,20 @@ interface MovieDao {
     @Query(
         """
         SELECT * FROM movies
-        WHERE (:categoryId IS NULL OR categoryId = :categoryId)
+        WHERE hidden = 0 AND (:categoryId IS NULL OR categoryId = :categoryId)
         ORDER BY addedMillis DESC, name
         """
     )
     fun observe(categoryId: String?): Flow<List<Movie>>
 
-    @Query("SELECT * FROM movies WHERE favourite = 1 ORDER BY name")
+    @Query("SELECT * FROM movies WHERE favourite = 1 AND hidden = 0 ORDER BY name")
     fun observeFavourites(): Flow<List<Movie>>
 
-    @Query("SELECT * FROM movies WHERE name LIKE '%' || :query || '%' ORDER BY name LIMIT :limit")
+    @Query("SELECT * FROM movies WHERE hidden = 0 AND name LIKE '%' || :query || '%' ORDER BY name LIMIT :limit")
     fun search(query: String, limit: Int = 200): Flow<List<Movie>>
 
     /** Newest-first, for the "Recently Added" home row. Reactive so it fills in as VOD sync lands. */
-    @Query("SELECT * FROM movies ORDER BY addedMillis DESC LIMIT :limit")
+    @Query("SELECT * FROM movies WHERE hidden = 0 ORDER BY addedMillis DESC LIMIT :limit")
     fun observeRecentlyAdded(limit: Int): Flow<List<Movie>>
 
     /**
@@ -444,12 +481,12 @@ interface MovieDao {
      * genre-affinity recommendations, more-like-this). One pass over a few thousand rows is cheap;
      * per-genre `LIKE` queries would multiply round-trips and risk substring false positives.
      */
-    @Query("SELECT * FROM movies ORDER BY addedMillis DESC")
+    @Query("SELECT * FROM movies WHERE hidden = 0 ORDER BY addedMillis DESC")
     suspend fun all(): List<Movie>
 
     /** How many movies are on disk. A cheap COUNT the home feeds use to tell "the library grew"
      *  from "same as last time" without loading every row (see VodViewModel.loadHomeFeeds). */
-    @Query("SELECT COUNT(*) FROM movies")
+    @Query("SELECT COUNT(*) FROM movies WHERE hidden = 0")
     suspend fun count(): Int
 
     /**
@@ -459,7 +496,7 @@ interface MovieDao {
     @Query(
         """
         SELECT * FROM movies
-        WHERE sourceId = :sourceId AND id != :excludeId
+        WHERE hidden = 0 AND sourceId = :sourceId AND id != :excludeId
           AND (:categoryId IS NULL OR categoryId = :categoryId)
         ORDER BY rating DESC, addedMillis DESC
         LIMIT :limit
@@ -476,7 +513,7 @@ interface MovieDao {
     @Query(
         """
         SELECT * FROM movies
-        WHERE `cast` IS NOT NULL AND `cast` != '' AND `cast` LIKE '%' || :name || '%'
+        WHERE hidden = 0 AND `cast` IS NOT NULL AND `cast` != '' AND `cast` LIKE '%' || :name || '%'
         ORDER BY rating DESC, addedMillis DESC
         LIMIT :limit
         """
@@ -487,7 +524,7 @@ interface MovieDao {
     @Query(
         """
         SELECT * FROM movies
-        WHERE director IS NOT NULL AND director != '' AND director LIKE '%' || :name || '%'
+        WHERE hidden = 0 AND director IS NOT NULL AND director != '' AND director LIKE '%' || :name || '%'
         ORDER BY rating DESC, addedMillis DESC
         LIMIT :limit
         """
@@ -516,39 +553,87 @@ interface MovieDao {
 
     @Query("DELETE FROM movies WHERE sourceId = :sourceId")
     suspend fun deleteForSource(sourceId: Long)
+
+    // --- Web manager: hide / show movies -------------------------------------------------------------
+    // Browse queries above skip `hidden` rows; these are the manager's own, which must still see them.
+
+    @Query("UPDATE movies SET hidden = :hidden WHERE id = :id")
+    suspend fun setHidden(id: Long, hidden: Boolean)
+
+    /** One category's movies, hidden included, optionally scoped to one source. */
+    @Query(
+        """
+        SELECT * FROM movies
+        WHERE (:sourceId IS NULL OR sourceId = :sourceId) AND categoryId = :categoryId
+        ORDER BY name
+        """
+    )
+    suspend fun inCategoryIncludingHidden(sourceId: Long?, categoryId: String): List<Movie>
+
+    /** Hides or shows a whole category in one statement. Returns how many rows changed. */
+    @Query(
+        """
+        UPDATE movies SET hidden = :hidden
+        WHERE categoryId = :categoryId
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND hidden != :hidden
+        """
+    )
+    suspend fun setHiddenInCategory(sourceId: Long?, categoryId: String, hidden: Boolean): Int
+
+    /** Count per (source, category), hidden included. */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM movies
+        WHERE categoryId IS NOT NULL
+        GROUP BY sourceId, categoryId
+        """
+    )
+    suspend fun countsByCategory(): List<CategoryChannelCount>
+
+    /** Hidden count per (source, category). */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM movies
+        WHERE categoryId IS NOT NULL AND hidden = 1
+        GROUP BY sourceId, categoryId
+        """
+    )
+    suspend fun hiddenCountsByCategory(): List<CategoryChannelCount>
 }
 
-@Dao
 interface SeriesDao {
     @Query(
         """
         SELECT * FROM series
-        WHERE (:categoryId IS NULL OR categoryId = :categoryId)
+        WHERE hidden = 0 AND (:categoryId IS NULL OR categoryId = :categoryId)
         ORDER BY addedMillis DESC, name
         """
     )
     fun observe(categoryId: String?): Flow<List<Series>>
 
-    @Query("SELECT * FROM series WHERE name LIKE '%' || :query || '%' ORDER BY name LIMIT :limit")
+    @Query("SELECT * FROM series WHERE hidden = 0 AND name LIKE '%' || :query || '%' ORDER BY name LIMIT :limit")
     fun search(query: String, limit: Int = 200): Flow<List<Series>>
 
     /** Newest-first, for the "Recently Added" home row. Reactive so it fills in as VOD sync lands. */
-    @Query("SELECT * FROM series ORDER BY addedMillis DESC LIMIT :limit")
+    @Query("SELECT * FROM series WHERE hidden = 0 ORDER BY addedMillis DESC LIMIT :limit")
     fun observeRecentlyAdded(limit: Int): Flow<List<Series>>
 
     /** Every series, newest first — working set for the Kotlin-side by-genre / more-like-this feeds. */
-    @Query("SELECT * FROM series ORDER BY addedMillis DESC")
+    @Query("SELECT * FROM series WHERE hidden = 0 ORDER BY addedMillis DESC")
     suspend fun all(): List<Series>
 
     /** How many series are on disk — the cheap "did the library grow" check for the home feeds. */
-    @Query("SELECT COUNT(*) FROM series")
+    @Query("SELECT COUNT(*) FROM series WHERE hidden = 0")
     suspend fun count(): Int
 
     /** Fallback for More-Like-This when a series has no genre: same source/category, best-rated first. */
     @Query(
         """
         SELECT * FROM series
-        WHERE sourceId = :sourceId AND id != :excludeId
+        WHERE hidden = 0 AND sourceId = :sourceId AND id != :excludeId
           AND (:categoryId IS NULL OR categoryId = :categoryId)
         ORDER BY rating DESC, addedMillis DESC
         LIMIT :limit
@@ -561,7 +646,7 @@ interface SeriesDao {
     @Query(
         """
         SELECT * FROM series
-        WHERE `cast` IS NOT NULL AND `cast` != '' AND `cast` LIKE '%' || :name || '%'
+        WHERE hidden = 0 AND `cast` IS NOT NULL AND `cast` != '' AND `cast` LIKE '%' || :name || '%'
         ORDER BY rating DESC, addedMillis DESC
         LIMIT :limit
         """
@@ -586,9 +671,57 @@ interface SeriesDao {
 
     @Query("DELETE FROM series WHERE sourceId = :sourceId")
     suspend fun deleteForSource(sourceId: Long)
+
+    // --- Web manager: hide / show series -------------------------------------------------------------
+    // Browse queries above skip `hidden` rows; these are the manager's own, which must still see them.
+
+    @Query("UPDATE series SET hidden = :hidden WHERE id = :id")
+    suspend fun setHidden(id: Long, hidden: Boolean)
+
+    /** One category's series, hidden included, optionally scoped to one source. */
+    @Query(
+        """
+        SELECT * FROM series
+        WHERE (:sourceId IS NULL OR sourceId = :sourceId) AND categoryId = :categoryId
+        ORDER BY name
+        """
+    )
+    suspend fun inCategoryIncludingHidden(sourceId: Long?, categoryId: String): List<Series>
+
+    /** Hides or shows a whole category in one statement. Returns how many rows changed. */
+    @Query(
+        """
+        UPDATE series SET hidden = :hidden
+        WHERE categoryId = :categoryId
+          AND (:sourceId IS NULL OR sourceId = :sourceId)
+          AND hidden != :hidden
+        """
+    )
+    suspend fun setHiddenInCategory(sourceId: Long?, categoryId: String, hidden: Boolean): Int
+
+    /** Count per (source, category), hidden included. */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM series
+        WHERE categoryId IS NOT NULL
+        GROUP BY sourceId, categoryId
+        """
+    )
+    suspend fun countsByCategory(): List<CategoryChannelCount>
+
+    /** Hidden count per (source, category). */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM series
+        WHERE categoryId IS NOT NULL AND hidden = 1
+        GROUP BY sourceId, categoryId
+        """
+    )
+    suspend fun hiddenCountsByCategory(): List<CategoryChannelCount>
 }
 
-@Dao
 interface EpisodeDao {
     @Query("SELECT * FROM episodes WHERE sourceId = :sourceId AND seriesId = :seriesId ORDER BY season, episodeNumber")
     fun observeForSeries(sourceId: Long, seriesId: String): Flow<List<Episode>>
