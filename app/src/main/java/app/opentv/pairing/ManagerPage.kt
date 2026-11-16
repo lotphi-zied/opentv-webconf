@@ -181,6 +181,11 @@ object ManagerPage {
             </details>
 
             <section id="catView">
+              <div id="modeBar" class="chips" style="margin-bottom:12px;">
+                <div class="chip on" data-mode="live">Live TV</div>
+                <div class="chip" data-mode="movie">Movies</div>
+                <div class="chip" data-mode="series">Series</div>
+              </div>
               <div id="srcBar" class="chips" hidden></div>
               <input id="catSearch" class="search" type="text" placeholder="Filter categories…"
                      autocapitalize="off" autocorrect="off" spellcheck="false">
@@ -215,6 +220,7 @@ object ManagerPage {
           var currentSource = null;   // selected source filter, null = all
           var currentCat = null;      // the category object being viewed
           var channels = [];          // rows currently shown, in display order
+          var mode = 'live';          // 'live' | 'movie' | 'series' — what the manager is browsing
 
           var el = function(id){ return document.getElementById(id); };
           var statusTimer = null;
@@ -244,7 +250,7 @@ object ManagerPage {
           // ---- Categories --------------------------------------------------------------------
           async function loadMeta(){
             try {
-              meta = await getJson('/meta');
+              meta = await getJson(mode === 'live' ? '/meta' : '/vod/meta?kind=' + mode);
               renderSources();
               renderCategories();
             } catch (e) {
@@ -281,31 +287,32 @@ object ManagerPage {
             var empty = el('catEmpty');
             if (cats.length === 0) {
               empty.hidden = false;
-              empty.textContent = (meta.categories && meta.categories.length) ? 'No categories match that.' : 'No channels yet — add a provider above to get started.';
+              empty.textContent = (meta.categories && meta.categories.length) ? 'No categories match that.' : (mode === 'live' ? 'No channels yet — add a provider above to get started.' : 'Nothing here yet — movies and series appear after a sync.');
               return;
             }
             empty.hidden = true;
             cats.forEach(function(c){
               var row = document.createElement('div');
-              row.className = 'cat' + (c.bulk === 'hidden' ? ' off' : '');
+              row.className = 'cat' + (c.count > 0 && (c.hidden || 0) >= c.count ? ' off' : '');
               var label = document.createElement('span'); label.className = 'label'; label.textContent = c.label;
-              var count = document.createElement('span'); count.className = 'count'; count.textContent = c.count;
+              var count = document.createElement('span'); count.className = 'count';
+              count.textContent = (c.hidden || 0) > 0 ? ((c.hidden >= c.count ? 'all' : c.hidden) + ' hidden \u00b7 ' + c.count) : c.count;
               var chev = document.createElement('span'); chev.className = 'chev'; chev.innerHTML = '&#8250;';
               var showAll = document.createElement('span'); showAll.className = 'mini';
               showAll.innerHTML = '&#128065;'; showAll.title = 'Show the whole category';
               showAll.onclick = function(e){
                 e.stopPropagation();
                 bulk(c, { hidden: false }, 'Showing the whole category').then(function(r){
-                  if (r) { c.bulk = 'shown'; row.className = 'cat'; }
+                  if (r) { c.hidden = 0; renderCategories(); }
                 });
               };
               var hideAll = document.createElement('span'); hideAll.className = 'mini';
               hideAll.innerHTML = '&#128584;'; hideAll.title = 'Hide the whole category';
               hideAll.onclick = function(e){
                 e.stopPropagation();
-                if (!confirm('Hide all ' + c.count + ' channels in "' + c.label + '"?')) return;
+                if (!confirm('Hide all ' + c.count + (mode === 'live' ? ' channels' : ' titles') + ' in "' + c.label + '"?')) return;
                 bulk(c, { hidden: true }, 'Category hidden').then(function(r){
-                  if (r) { c.bulk = 'hidden'; row.className = 'cat off'; }
+                  if (r) { c.hidden = c.count; renderCategories(); }
                 });
               };
               row.appendChild(label); row.appendChild(count); row.appendChild(showAll); row.appendChild(hideAll); row.appendChild(chev);
@@ -316,16 +323,18 @@ object ManagerPage {
           el('catSearch').addEventListener('input', renderCategories);
 
           // ---- Bulk actions ------------------------------------------------------------------
-          // One call applies a change to every channel of a category. Resolves to the reply, or to
-          // null after showing an error, so callers only update the page on success.
+          // One call changes a whole category in a single statement on the TV. Resolves to the
+          // reply, or to null after showing an error, so callers only update the page on success.
           function bulk(cat, patch, label){
             var body = { cat: cat.id, source: cat.sourceId };
+            if (mode !== 'live') body.kind = mode;
             for (var k in patch) body[k] = patch[k];
             setStatus('Working…');
-            return post('/bulk', body)
+            return post(mode === 'live' ? '/bulk' : '/vod/bulk', body)
               .then(function(r){
                 if (!(r && r.ok)) { setStatus("Couldn't apply that.", 'err'); return null; }
-                setStatus(label + ' — ' + r.changed + (r.changed === 1 ? ' channel' : ' channels') + ' updated', 'ok');
+                var n = r.changed || 0;
+                setStatus(label + ' — ' + n + (n === 1 ? ' item' : ' items') + ' updated', 'ok');
                 return r;
               })
               .catch(function(){ setStatus(UNREACH, 'err'); return null; });
@@ -334,15 +343,23 @@ object ManagerPage {
           // ---- Channels ----------------------------------------------------------------------
           async function openCategory(cat){
             currentCat = cat;
-            delete cat.bulk;   // individual toggles below make any whole-category state stale
             el('catView').hidden = true;
             el('chanView').hidden = false;
             el('chanHead').textContent = cat.label;
+            var vod = mode !== 'live';
+            el('bulkFav').hidden = vod; el('bulkUnfav').hidden = vod;
+            el('chanHint').textContent = vod
+              ? 'Use the eye to hide or show a title in the app. The buttons below act on the whole category.'
+              : 'Tap a name to rename. Star to favourite, eye to hide, arrows to reorder. Use the buttons below to act on the whole category.';
             window.scrollTo(0, 0);
             var listEl = el('chanList'); listEl.innerHTML = '';
             var empty = el('chanEmpty'); empty.hidden = true;
             try {
-              channels = await getJson('/channels?cat=' + encodeURIComponent(cat.id) + '&source=' + cat.sourceId);
+              channels = await getJson(
+                vod
+                  ? '/vod/items?kind=' + mode + '&cat=' + encodeURIComponent(cat.id) + '&source=' + cat.sourceId
+                  : '/channels?cat=' + encodeURIComponent(cat.id) + '&source=' + cat.sourceId
+              );
               renderChannels();
             } catch (e) {
               empty.hidden = false; empty.textContent = UNREACH;
@@ -353,6 +370,7 @@ object ManagerPage {
             el('chanView').hidden = true;
             el('catView').hidden = false;
             channels = [];
+            loadMeta();   // individual toggles changed the hidden counts
           };
 
           function bulkChannels(patch, label){
@@ -368,7 +386,7 @@ object ManagerPage {
           }
           el('bulkShow').onclick = function(){ bulkChannels({ hidden: false }, 'Showing all'); };
           el('bulkHide').onclick = function(){
-            if (confirm('Hide all ' + channels.length + ' channels in this category?')) bulkChannels({ hidden: true }, 'Hidden');
+            if (confirm('Hide all ' + channels.length + (mode === 'live' ? ' channels' : ' titles') + ' in this category?')) bulkChannels({ hidden: true }, 'Hidden');
           };
           el('bulkFav').onclick = function(){ bulkChannels({ favourite: true }, 'All favourited'); };
           el('bulkUnfav').onclick = function(){
@@ -379,9 +397,9 @@ object ManagerPage {
             var listEl = el('chanList');
             listEl.innerHTML = '';
             var empty = el('chanEmpty');
-            if (!channels.length) { empty.hidden = false; empty.textContent = 'No channels in this category.'; return; }
+            if (!channels.length) { empty.hidden = false; empty.textContent = (mode === 'live' ? 'No channels in this category.' : 'No titles in this category.'); return; }
             empty.hidden = true;
-            channels.forEach(function(c, i){ listEl.appendChild(buildRow(c, i)); });
+            channels.forEach(function(c, i){ listEl.appendChild(mode === 'live' ? buildRow(c, i) : buildVodRow(c)); });
           }
 
           function buildRow(c, index){
@@ -458,6 +476,70 @@ object ManagerPage {
             row.appendChild(logo); row.appendChild(mid); row.appendChild(ctrls);
             return row;
           }
+
+          // A title in the Movies / Series view: poster, name, year, and one eye to hide or show it.
+          function buildVodRow(c){
+            var row = document.createElement('div');
+            row.className = 'row' + (c.hidden ? ' hidden' : '');
+
+            var logo = document.createElement('img');
+            logo.className = 'logo'; logo.alt = ''; logo.loading = 'lazy';
+            if (c.poster) { logo.src = c.poster; } else { logo.style.visibility = 'hidden'; }
+            logo.onerror = function(){ logo.style.visibility = 'hidden'; };
+
+            var mid = document.createElement('div'); mid.className = 'rowmeta';
+            var name = document.createElement('span'); name.className = 'name'; name.textContent = c.name;
+            var sub = document.createElement('div'); sub.className = 'sub';
+            mid.appendChild(name); mid.appendChild(sub);
+            function refreshSub(){
+              sub.innerHTML = '';
+              if (c.year) sub.appendChild(document.createTextNode(String(c.year)));
+              if (c.hidden) {
+                if (sub.childNodes.length) sub.appendChild(document.createTextNode('  ·  '));
+                var b = document.createElement('span'); b.className = 'badge'; b.textContent = 'Hidden';
+                sub.appendChild(b);
+              }
+              if (!sub.childNodes.length) sub.textContent = ' ';
+            }
+            refreshSub();
+
+            var ctrls = document.createElement('div'); ctrls.className = 'ctrls';
+            var eye = document.createElement('div');
+            function paintEye(){
+              eye.className = 'btn eye' + (c.hidden ? '' : ' on');
+              eye.innerHTML = c.hidden ? '&#128584;' : '&#128065;';
+              eye.title = c.hidden ? 'Hidden — tap to show' : 'Showing — tap to hide';
+            }
+            paintEye();
+            eye.onclick = function(){
+              var target = !c.hidden;
+              post('/vod/item', { kind: mode, id: c.id, hidden: target })
+                .then(function(){
+                  c.hidden = target;
+                  row.className = 'row' + (target ? ' hidden' : '');
+                  paintEye(); refreshSub();
+                  setStatus(target ? 'Hidden in the app' : 'Showing in the app', 'ok');
+                })
+                .catch(function(){ setStatus(UNREACH, 'err'); });
+            };
+            ctrls.appendChild(eye);
+            row.appendChild(logo); row.appendChild(mid); row.appendChild(ctrls);
+            return row;
+          }
+
+          // ---- Live TV / Movies / Series switch ------------------------------------------------
+          function setMode(next){
+            mode = next;
+            currentSource = null;
+            Array.prototype.forEach.call(document.querySelectorAll('#modeBar .chip'), function(chip){
+              chip.className = 'chip' + (chip.getAttribute('data-mode') === next ? ' on' : '');
+            });
+            el('catSearch').value = '';
+            loadMeta();
+          }
+          Array.prototype.forEach.call(document.querySelectorAll('#modeBar .chip'), function(chip){
+            chip.onclick = function(){ setMode(chip.getAttribute('data-mode')); };
+          });
 
           function startRename(span, c){
             var input = document.createElement('input');
