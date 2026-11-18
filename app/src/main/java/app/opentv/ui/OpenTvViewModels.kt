@@ -290,6 +290,13 @@ class ChannelsViewModel(app: Application) : AndroidViewModel(app) {
         val next: Programme?,
         /** Every programme for this channel inside the guide window, start-ordered. */
         val programmes: List<Programme>,
+        /**
+         * EVERY channel row folded into this logical channel, including identical-quality copies
+         * that [variants] collapses (the same stream listed in two categories). Hiding or
+         * favouriting a row must reach all of them: acting on [variants] alone left the collapsed
+         * copy untouched, so the channel stayed visible after being "hidden".
+         */
+        val members: List<Channel> = variants,
     ) {
         val key: Any get() = if (primary.groupKey.isEmpty()) primary.id else primary.groupKey
     }
@@ -465,6 +472,7 @@ class ChannelsViewModel(app: Application) : AndroidViewModel(app) {
                 now = list.firstOrNull { it.isLiveAt(now) },
                 next = list.firstOrNull { it.startUtcMillis > now },
                 programmes = list,
+                members = group.toList(),
             )
         }
     }
@@ -617,10 +625,10 @@ class ChannelsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectManagerCategory(key: String?) { managerSelectedCategory.value = key }
 
-    /** Hide or show a whole logical channel — every quality variant follows. */
+    /** Hide or show a whole logical channel — every quality variant AND every duplicate follows. */
     fun setRowHidden(row: Row, hidden: Boolean) {
         viewModelScope.launch {
-            row.variants.forEach { graph.catalogRepository.setChannelHidden(it.id, hidden) }
+            row.members.forEach { graph.catalogRepository.setChannelHidden(it.id, hidden) }
         }
     }
 
@@ -629,13 +637,41 @@ class ChannelsViewModel(app: Application) : AndroidViewModel(app) {
             // Favouriting the row favourites the logical channel: every variant follows,
             // so the choice survives switching quality.
             val target = !row.primary.favourite
-            row.variants.forEach { graph.catalogRepository.setChannelFavourite(it.id, target) }
+            row.members.forEach { graph.catalogRepository.setChannelFavourite(it.id, target) }
         }
     }
 
     fun hide(row: Row) {
         viewModelScope.launch {
-            row.variants.forEach { graph.catalogRepository.setChannelHidden(it.id, true) }
+            row.members.forEach { graph.catalogRepository.setChannelHidden(it.id, true) }
+        }
+    }
+
+    // ---- Channel manager: whole-category actions -----------------------------------------------
+    // One SQL statement per underlying provider category (see CatalogRepository.setCategoryHidden),
+    // so hiding or favouriting a category of thousands of channels is instant. A rail entry can fold
+    // several provider categories ([CategoryGroup.ids]); every one of them is updated.
+
+    /** Hides or shows every channel of a rail entry, without opening it. */
+    fun setManagerGroupHidden(group: CategoryGroup, hidden: Boolean) {
+        val source = managerSelectedSource.value
+        viewModelScope.launch {
+            group.ids.forEach { graph.catalogRepository.setCategoryHidden(source, it, hidden) }
+        }
+    }
+
+    /** Hides or shows every channel of the category currently open in the manager. */
+    fun setManagerCategoryHidden(hidden: Boolean) {
+        val group = managerCategoryGroups.value.firstOrNull { it.key == managerSelectedCategory.value } ?: return
+        setManagerGroupHidden(group, hidden)
+    }
+
+    /** Favourites (or un-favourites) every channel of the category currently open in the manager. */
+    fun setManagerCategoryFavourite(favourite: Boolean) {
+        val group = managerCategoryGroups.value.firstOrNull { it.key == managerSelectedCategory.value } ?: return
+        val source = managerSelectedSource.value
+        viewModelScope.launch {
+            group.ids.forEach { graph.catalogRepository.setCategoryFavourite(source, it, favourite) }
         }
     }
 
@@ -1258,7 +1294,8 @@ class SyncViewModel(app: Application) : AndroidViewModel(app) {
  */
 class WebManagerViewModel(app: Application) : AndroidViewModel(app) {
     private val graph = ServiceLocator.get(app)
-    private val server = ManagerServer(getApplication(), viewModelScope, graph.catalogRepository, graph.settings, graph.sourceRepository) 
+    private val server = ManagerServer(app, viewModelScope, graph.catalogRepository, graph.settings, graph.sourceRepository)
+
     val state: StateFlow<ManagerServer.State> = server.state
 
     fun start() = server.start()
