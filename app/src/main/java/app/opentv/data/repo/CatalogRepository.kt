@@ -32,6 +32,7 @@ import app.opentv.data.remote.XtreamApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -594,6 +595,12 @@ class CatalogRepository(
     /** Adds or removes every channel of one category from the favourites. Returns rows changed. */
     suspend fun setCategoryFavourite(sourceId: Long?, categoryId: String, favourite: Boolean): Int =
         channelDao.setFavouriteInCategory(sourceId, categoryId, favourite)
+
+    /** Visible channels per provider category id (any source), live — see [ChannelDao.observeVisibleCountsByCategory]. */
+    fun observeVisibleChannelCountsByCategory(): Flow<Map<String, Int>> =
+        channelDao.observeVisibleCountsByCategory().map { rows ->
+            rows.groupBy({ it.categoryId }, { it.count }).mapValues { (_, counts) -> counts.sum() }
+        }
 
     /** Number of hidden channels per (source, category) — lets a category show "12 of 340 hidden". */
     suspend fun hiddenChannelCountsByCategory(): Map<Pair<Long, String>, Int> =
