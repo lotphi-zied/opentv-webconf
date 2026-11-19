@@ -269,10 +269,25 @@ class ChannelsViewModel(app: Application) : AndroidViewModel(app) {
             else groups.filter { it.key in hidden }.flatMap { it.ids }.toSet()
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
 
-    /** The rail's view of categories: hidden ones drop out until the session is unlocked. */
+    /**
+     * Visible-channel count per provider category id, live. Null until the first emission, so the
+     * rail is not filtered (and does not flash empty) while the counts load.
+     */
+    private val visibleChannelCounts: StateFlow<Map<String, Int>?> =
+        graph.catalogRepository.observeVisibleChannelCountsByCategory()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+
+    /**
+     * The rail's view of categories: hidden ones drop out until the session is unlocked, and so does
+     * an entry whose channels the user has all hidden in the channel manager — there is nothing to
+     * browse, so the name should not linger as an empty shelf.
+     */
     val visibleCategoryGroups: StateFlow<List<CategoryGroup>> =
-        combine(categoryGroups, settings.hiddenCategories, settings.hiddenUnlocked) { groups, hidden, unlocked ->
-            if (unlocked) groups else groups.filter { it.key !in hidden }
+        combine(categoryGroups, settings.hiddenCategories, settings.hiddenUnlocked, visibleChannelCounts) {
+                groups, hidden, unlocked, counts ->
+            val allowed = if (unlocked) groups else groups.filter { it.key !in hidden }
+            if (counts == null) allowed
+            else allowed.filter { group -> group.ids.any { (counts[it] ?: 0) > 0 } }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /**
