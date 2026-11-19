@@ -32,6 +32,7 @@ import app.opentv.data.remote.XtreamApi
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -165,7 +166,30 @@ class CatalogRepository(
      * building" (channels exist) apart from "nothing loaded" (a failed or empty sync). */
     fun observeChannelCount(): Flow<Int> = channelDao.observeVisibleCount()
 
-    fun observeCategories(kind: StreamKind): Flow<List<Category>> = categoryDao.observe(kind)
+    /**
+     * Categories of a kind, live. For movies and series a category with no *visible* title left
+     * (every title hidden from the web manager) drops out, so the browse screens do not list an
+     * empty shelf. Live categories are returned as-is: the guide's rail does its own filtering.
+     */
+    fun observeCategories(kind: StreamKind): Flow<List<Category>> = when (kind) {
+        StreamKind.MOVIE ->
+            combine(categoryDao.observe(kind), movieDao.observeVisibleCountsByCategory()) { categories, counts ->
+                withVisibleTitles(categories, counts)
+            }
+        StreamKind.SERIES ->
+            combine(categoryDao.observe(kind), seriesDao.observeVisibleCountsByCategory()) { categories, counts ->
+                withVisibleTitles(categories, counts)
+            }
+        StreamKind.LIVE -> categoryDao.observe(kind)
+    }
+
+    private fun withVisibleTitles(
+        categories: List<Category>,
+        counts: List<app.opentv.data.db.CategoryChannelCount>,
+    ): List<Category> {
+        val visible = counts.mapTo(HashSet()) { it.sourceId to it.categoryId }
+        return categories.filter { (it.sourceId to it.id) in visible }
+    }
 
     fun observeMovies(categoryId: String? = null): Flow<List<Movie>> = movieDao.observe(categoryId)
 
