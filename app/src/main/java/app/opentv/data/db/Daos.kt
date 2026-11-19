@@ -606,6 +606,20 @@ interface MovieDao {
     )
     suspend fun countsByCategory(): List<CategoryChannelCount>
 
+    /**
+     * Visible (not hidden) count per (source, category), live. The Movies / Series category lists use
+     * it to drop a category whose titles are all hidden, instead of leaving an empty shelf.
+     */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM movies
+        WHERE categoryId IS NOT NULL AND hidden = 0
+        GROUP BY sourceId, categoryId
+        """
+    )
+    fun observeVisibleCountsByCategory(): Flow<List<CategoryChannelCount>>
+
     /** Hidden count per (source, category). */
     @Query(
         """
@@ -724,6 +738,20 @@ interface SeriesDao {
         """
     )
     suspend fun countsByCategory(): List<CategoryChannelCount>
+
+    /**
+     * Visible (not hidden) count per (source, category), live. The Movies / Series category lists use
+     * it to drop a category whose titles are all hidden, instead of leaving an empty shelf.
+     */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM series
+        WHERE categoryId IS NOT NULL AND hidden = 0
+        GROUP BY sourceId, categoryId
+        """
+    )
+    fun observeVisibleCountsByCategory(): Flow<List<CategoryChannelCount>>
 
     /** Hidden count per (source, category). */
     @Query(
