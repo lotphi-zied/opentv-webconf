@@ -327,7 +327,7 @@ object ManagerPage {
           // reply, or to null after showing an error, so callers only update the page on success.
           function bulk(cat, patch, label){
             var body = { cat: cat.id, source: cat.sourceId };
-            if (mode !== 'live') body.kind = mode;
+            if (mode !== 'live') body.kind = mode; else body.cats = cat.ids || [cat.id];
             for (var k in patch) body[k] = patch[k];
             setStatus('Working…');
             return post(mode === 'live' ? '/bulk' : '/vod/bulk', body)
@@ -358,7 +358,7 @@ object ManagerPage {
               channels = await getJson(
                 vod
                   ? '/vod/items?kind=' + mode + '&cat=' + encodeURIComponent(cat.id) + '&source=' + cat.sourceId
-                  : '/channels?cat=' + encodeURIComponent(cat.id) + '&source=' + cat.sourceId
+                  : '/channels?cats=' + encodeURIComponent(JSON.stringify(cat.ids || [cat.id])) + '&source=' + cat.sourceId
               );
               renderChannels();
             } catch (e) {
