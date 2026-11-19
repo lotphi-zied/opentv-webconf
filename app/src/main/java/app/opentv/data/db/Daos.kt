@@ -215,6 +215,20 @@ interface ChannelDao {
     )
     suspend fun setFavouriteInCategory(sourceId: Long?, categoryId: String, favourite: Boolean): Int
 
+    /**
+     * Visible (not hidden) channel count per (source, category), live. The guide's category rail uses
+     * it to drop an entry whose channels are all hidden, instead of leaving an empty shelf.
+     */
+    @Query(
+        """
+        SELECT sourceId, categoryId, COUNT(*) AS count
+        FROM channels
+        WHERE categoryId IS NOT NULL AND hidden = 0
+        GROUP BY sourceId, categoryId
+        """
+    )
+    fun observeVisibleCountsByCategory(): Flow<List<CategoryChannelCount>>
+
     /** Hidden-channel count per (source, category) — lets a category show "12 of 340 hidden". */
     @Query(
         """
