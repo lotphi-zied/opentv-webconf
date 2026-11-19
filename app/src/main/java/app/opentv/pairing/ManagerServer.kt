@@ -12,6 +12,7 @@ import app.opentv.core.AppSettings
 import app.opentv.data.model.Channel
 import app.opentv.data.model.Source
 import app.opentv.data.model.StreamKind
+import app.opentv.data.parser.ChannelNameNormalizer
 import app.opentv.data.parser.displayTitle
 import app.opentv.data.model.SourceKind
 import app.opentv.data.model.shownName
@@ -39,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 
 /**
@@ -263,22 +265,36 @@ class ManagerServer(
         val counts = catalog.categoryChannelCounts()
             .associateBy({ it.sourceId to it.categoryId }, { it.count })
         val hiddenCounts = catalog.hiddenChannelCountsByCategory()
-        // Only categories that belong to an enabled source AND actually hold channels — an empty
-        // category is noise on a phone, and a category count includes hidden rows so it stays > 0
-        // for a category whose channels are all hidden (which is exactly what you'd browse to fix).
-        val categories = catalog.liveCategories()
+        // The TV's category rail FOLDS provider categories whose names differ only by language
+        // prefix or codec ("FR| PRIME RAW" + "IT| PRIME RAW" = one "PRIME" entry; see
+        // ChannelsViewModel.foldCategories). Show the same entries here, so hiding "PRIME" on the
+        // phone hides exactly what hiding "PRIME" on the TV hides. Folded per source, so two
+        // providers stay separate.
+        val folded = LinkedHashMap<Pair<Long, String>, Pair<String, MutableList<String>>>()
+        catalog.liveCategories()
             .filter { it.sourceId in sourceIds }
-            .mapNotNull { cat ->
-                val count = counts[cat.sourceId to cat.id] ?: 0
-                if (count <= 0) null
-                else CategoryDto(
-                    id = cat.id,
-                    label = cat.name,
-                    sourceId = cat.sourceId,
-                    count = count,
-                    hidden = hiddenCounts[cat.sourceId to cat.id] ?: 0,
-                )
+            .forEach { cat ->
+                val normalised = ChannelNameNormalizer.normalize(cat.name)
+                val key = cat.sourceId to normalised.groupKey.ifEmpty { cat.id }
+                folded.getOrPut(key) { normalised.baseName to mutableListOf() }.second += cat.id
             }
+        // Only groups that actually hold channels — an empty one is noise on a phone, and a count
+        // includes hidden rows so it stays > 0 for a group whose channels are all hidden (which is
+        // exactly what you'd browse to fix).
+        val categories = folded.mapNotNull { (key, value) ->
+            val sourceId = key.first
+            val ids = value.second
+            val count = ids.sumOf { counts[sourceId to it] ?: 0 }
+            if (count <= 0) null
+            else CategoryDto(
+                id = ids.first(),
+                label = value.first,
+                sourceId = sourceId,
+                count = count,
+                hidden = ids.sumOf { hiddenCounts[sourceId to it] ?: 0 },
+                ids = ids,
+            )
+        }
         json.encodeToString(
             MetaDto.serializer(),
             MetaDto(sources = sources.map { SourceDto(it.id, it.name) }, categories = categories),
@@ -288,10 +304,18 @@ class ManagerServer(
     /** `GET /channels?cat=<id>[&source=<id>]` → the category's channels, hidden included. */
     private fun channelsJson(query: Map<String, String>): String = runBlocking {
         val serializer = ListSerializer(ChannelDto.serializer())
-        val cat = query["cat"]
-        if (cat.isNullOrBlank()) return@runBlocking json.encodeToString(serializer, emptyList())
+        // `cats` is a JSON array of provider category ids (a folded rail entry spans several);
+        // `cat` is the single-id form.
+        val ids = query["cats"]
+            ?.let { raw -> runCatching { json.decodeFromString(ListSerializer(String.serializer()), raw) }.getOrNull() }
+            ?: listOfNotNull(query["cat"])
+        val wanted = ids.filter { it.isNotBlank() }
+        if (wanted.isEmpty()) return@runBlocking json.encodeToString(serializer, emptyList())
         val source = query["source"]?.toLongOrNull()
-        val rows = catalog.channelsInCategoryForManager(source, cat).map { it.toDto() }
+        val rows = wanted
+            .flatMap { catalog.channelsInCategoryForManager(source, it) }
+            .distinctBy { it.id }
+            .map { it.toDto() }
         json.encodeToString(serializer, rows)
     }
 
@@ -335,14 +359,17 @@ class ManagerServer(
      */
     private fun handleBulk(output: OutputStream, body: String) {
         val req = runCatching { json.decodeFromString(BulkReq.serializer(), body) }.getOrNull()
-        if (req == null || req.cat.isBlank() || (req.hidden == null && req.favourite == null)) {
+        val ids = (req?.cats.orEmpty().ifEmpty { listOfNotNull(req?.cat) }).filter { it.isNotBlank() }
+        if (req == null || ids.isEmpty() || (req.hidden == null && req.favourite == null)) {
             output.write(PairingHttp.httpResponse("400 Bad Request", "text/plain", "Bad request."))
             return
         }
         val changed = runBlocking {
             var n = 0
-            req.hidden?.let { n += catalog.setCategoryHidden(req.source, req.cat, it) }
-            req.favourite?.let { n += catalog.setCategoryFavourite(req.source, req.cat, it) }
+            for (id in ids) {
+                req.hidden?.let { n += catalog.setCategoryHidden(req.source, id, it) }
+                req.favourite?.let { n += catalog.setCategoryFavourite(req.source, id, it) }
+            }
             n
         }
         writeJson(output, BulkResultDto.serializer(), BulkResultDto(ok = true, changed = changed))
@@ -710,6 +737,8 @@ class ManagerServer(
     val sourceId: Long,
     val count: Int,
     val hidden: Int = 0,
+    /** The provider category ids folded into this entry (the TV rail folds codec/language copies). */
+    val ids: List<String> = emptyList(),
 )
 
 @Serializable private data class ChannelDto(
@@ -736,6 +765,7 @@ class ManagerServer(
 
 @Serializable private data class BulkReq(
     val cat: String = "",
+    val cats: List<String> = emptyList(),
     val source: Long? = null,
     val hidden: Boolean? = null,
     val favourite: Boolean? = null,
