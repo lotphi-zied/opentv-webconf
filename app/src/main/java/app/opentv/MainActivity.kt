@@ -81,7 +81,7 @@ import app.opentv.ui.vod.MovieDetailScreen
 import app.opentv.ui.vod.PersonScreen
 import app.opentv.ui.vod.SeriesDetailScreen
 import app.opentv.ui.vod.VodPlayerScreen
-import app.opentv.update.UpdateGate
+//import app.opentv.update.UpdateGate
 import app.opentv.config.ConfigUpdater
 import kotlin.coroutines.resume
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -559,7 +559,7 @@ private fun OpenTvApp(isTelevision: Boolean) {
         }
 
         // Sits above the whole nav graph so a found update can prompt from any screen.
-        UpdateGate()
+       // UpdateGate()
 
         // "About to switch to a recording" banner — shows 30s before an auto-switch fires.
         RecordingSwitchBanner()
